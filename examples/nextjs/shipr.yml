@@ -1,0 +1,15 @@
+# Next.js. Two options:
+#  A) static export (next.config: output: 'export'): build locally, upload out/  <- shown here
+#  B) server mode: drop `build`, upload source, and on the server run
+#     hooks.remote_after: ["npm ci", "npm run build", "pm2 reload web"]
+version: 1
+project: {name: my-next-app}
+build:
+  commands: ["npm ci", "npm run build"]
+  output: out
+environments:
+  production:
+    branch: main
+    confirm: true
+    remote_path: /var/www/next
+    sftp: {host: example.com, username: deploy, key_file: ~/.ssh/id_ed25519}

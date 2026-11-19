@@ -1,0 +1,495 @@
+# shipr
+
+**Deploy an exact Git commit to your servers over SFTP, without FileZilla and without surprises.**
+
+shipr is a small, framework-agnostic command-line tool. You describe a project once in a
+committed `shipr.yml`. `shipr deploy` then:
+
+1. exports the commit,
+2. runs your build,
+3. uploads only what changed,
+4. asks before deleting anything,
+5. records who deployed what, and when.
+
+```console
+$ shipr deploy -e production
+my-app → production: main @ 3f2a9c1 "Fix checkout total"
+$ npm ci
+$ npm run build
+212 deployable files
+  upload  assets/index-8f3a.js  (new)
+  upload  index.html  (changed)
+  upload  config.php  (changed on server since last deploy, backup first)
+  delete  assets/index-1b2c.js  (renamed to assets/index-8f3a.js)
+3 to upload, 1 to delete, 208 unchanged, 0 protected
+Deploy 3f2a9c1 to PRODUCTION (sftp://deploy@example.com:22/var/www/html)? [y/N]: y
+Delete these 1 files from the server (they are backed up first)? [y/N]: y
+success: 3 uploaded, 1 deleted, 0 failed in 2.4s (deploy id 20261119T103205123Z-3f2a9c1)
+```
+
+## Contents
+
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Commands](#commands)
+- [Common workflows](#common-workflows)
+- [How it works](#how-it-works)
+- [Safety](#safety)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
+- [Contributing, security, license](#contributing-security-license)
+
+## Features
+
+- **Any stack.** PHP, React, Vue, Node.js, Next.js, static sites, or anything else. Builds are plain
+  shell commands; shipr has no framework-specific code.
+- **Deploys commits, not your working folder.** Uncommitted edits never reach the server, and every
+  deploy maps to a commit hash.
+- **Incremental.** Only changed files are uploaded, even for build output that isn't in Git.
+- **Safe by default.** Dry-run, confirmation for production, and a prompt before any deletion. Files
+  edited on the server are backed up before they are overwritten. Secrets are never uploaded.
+  Uploads are atomic, a lock prevents two deploys at once, and interrupted deploys resume.
+- **Works on cheap shared hosting.** It needs only SFTP. If the server also gives SSH shell access,
+  remote commands can run before or after the upload (`composer install`, `pm2 reload`,
+  migrations).
+- **History and rollback.** Every deploy is recorded on the server, and you can roll back to an
+  earlier one.
+- **Pluggable.** SFTP is the first provider. The core is written against a small provider
+  interface, so FTP, rsync and others can be added as plugins.
+
+## Requirements
+
+| | |
+|---|---|
+| Your machine | Python 3.10+ and `git`, on Linux, macOS or Windows |
+| The server | SFTP access. SSH shell access is optional and only needed for remote hooks. |
+| For builds | Whatever your build commands need (Node.js for `npm run build`, Composer, ...) |
+
+## Installation
+
+```bash
+# with uv (recommended): installs `shipr` as a global command in its own environment
+uv tool install git+<repo-url>
+
+# or with pipx
+pipx install git+<repo-url>
+
+# or from a local clone
+git clone <repo-url> && cd shipr
+uv tool install .
+```
+
+Check that it worked:
+
+```bash
+shipr --version
+```
+
+To upgrade, run `uv tool upgrade shipr` (or `pipx upgrade shipr`). To remove it, run
+`uv tool uninstall shipr`.
+
+## Quick start
+
+```bash
+cd my-project                       # any Git repository
+
+shipr init                          # 1. write a commented shipr.yml (detects npm/composer builds)
+$EDITOR shipr.yml                   # 2. set host, username and remote_path for each environment
+
+echo ".env" >> .gitignore           # 3. only if you use a password: keep it out of Git
+echo "SHIPR_PASSWORD=..." >> .env
+
+git add shipr.yml .gitignore
+git commit -m "Add shipr config"    # 4. shipr deploys committed content only
+
+shipr validate                      # 5. check the config
+shipr test -e staging --trust       # 6. verify the server key, write access, shell access
+shipr deploy -e staging --dry-run   # 7. preview
+shipr deploy -e staging             # 8. deploy
+```
+
+## Configuration
+
+### Where settings come from
+
+`shipr.yml` lives in your project. Commit it, and keep secrets out of it.
+
+shipr finds the file by searching the current directory and then each parent; you can also pass
+`-c path/to/shipr.yml`. For the environment you deploy to, settings are merged from these layers.
+Later layers win:
+
+1. `defaults:` in the **global** file:
+   - Linux: `~/.config/shipr/config.yml`
+   - macOS: `~/Library/Application Support/shipr/config.yml`
+   - Windows: `%APPDATA%\shipr\config.yml`
+2. The project's top-level `source`, `build`, `files` and `hooks`.
+3. The project's `defaults:`.
+4. The environment's own block under `environments:`.
+
+Mappings are merged key by key. A list replaces the earlier list rather than being added to it.
+
+### Minimal example
+
+```yaml
+version: 1
+project: {name: my-react-app}
+build:
+  commands: ["npm ci", "npm run build"]
+  output: dist
+environments:
+  production:
+    branch: main
+    confirm: true
+    remote_path: /var/www/html
+    sftp: {host: example.com, username: deploy, key_file: ~/.ssh/id_ed25519}
+```
+
+### Full reference
+
+```yaml
+version: 1                       # required format version
+
+project:
+  name: my-app                   # shown in output and history (default: folder name)
+
+source: .                        # project folder inside the repo; build commands run here
+
+build:
+  commands: []                   # shell commands, run in order inside the exported commit
+  output: .                      # folder (relative to source) whose contents are uploaded
+
+files:
+  include: ["**"]                # gitignore-style patterns, relative to the output folder
+  exclude: []                    # added to the built-in excludes (see below)
+  protect: []                    # never overwritten or deleted once they exist on the server
+  default_excludes: true         # false disables the built-in excludes (careful!)
+
+hooks:
+  local_before: []               # run locally before the build (also during --dry-run)
+  local_after: []                # run locally after a successful deploy that changed something
+  remote_before: []              # run on the server, in remote_path, before uploading
+  remote_after: []               # run on the server, in remote_path, after a fully successful upload
+
+defaults: {}                     # any environment key below, applied to every environment
+
+environments:
+  production:
+    provider: sftp               # sftp | local | a plugin
+    branch: main                 # what `shipr deploy` deploys by default (default: current HEAD)
+    remote_path: /var/www/html   # absolute, normalised path on the server; "/" is refused
+    state_path: null             # where shipr keeps its records (default: <remote_path>/.shipr)
+    confirm: false               # ask before deploying (use for production)
+    ssh_exec: auto               # auto | true | false: run hooks over SSH?
+    sftp:
+      host: example.com
+      port: 22
+      username: deploy
+      password: "${SHIPR_PASSWORD}"     # password auth, or:
+      key_file: ~/.ssh/id_ed25519       # key auth (RSA / ECDSA / Ed25519)
+      passphrase: "${SHIPR_KEY_PASS}"   # if the key is encrypted
+      timeout: 15                       # seconds, for connecting and for each operation
+      retries: 3                        # reconnect attempts on network errors (with backoff)
+      known_hosts: null                 # extra known_hosts file to trust
+```
+
+- If there is no `password`, shipr also tries your ssh-agent. You can leave out both `password`
+  and `key_file` and rely on the agent alone.
+- For a server with SFTP only (no shell), set `ssh_exec: false`. Otherwise shipr probes for a
+  shell, which can take up to `timeout` seconds on such servers.
+- The `local` provider deploys to a folder on this machine, such as a mounted share or for tests.
+  It takes `local: {root: /mnt/share}`, and `remote_path` is then resolved inside `root`.
+
+### Built-in excludes
+
+These are never uploaded unless you set `default_excludes: false`:
+
+```
+.git/  .shipr/  .env  .env.*  *.pem  *.key  id_rsa*  id_ed25519*  shipr.yml
+node_modules/  .DS_Store  Thumbs.db  *.log  *.shipr-tmp  *.shipr-old
+```
+
+Files marked `export-ignore` in `.gitattributes` are left out as well.
+
+### Secrets and variables
+
+Any setting can contain `${NAME}`. shipr takes the value from the process environment (your
+shell, or your CI's secrets). If the variable isn't set there, it reads the `.env` file next to
+`shipr.yml`. A variable that is used but missing is an error. `.env` values are read literally,
+with no `${...}` expansion inside them.
+
+**Commands are never interpolated.** `build.commands` and `hooks` run exactly as written, so a
+secret never shows up in output or in deploy history. Inside a command, use shell syntax
+(`$TOKEN`):
+
+- **Local commands** (build, `local_*`) get your environment, the values from `.env`, and
+  `SHIPR_ENV`, `SHIPR_COMMIT` and `SHIPR_PROJECT`.
+- **Remote commands** (`remote_*`) run with the server's own environment.
+
+### Recipes by project type
+
+Complete files are in [`examples/`](examples).
+
+| Project | What to configure |
+|---|---|
+| **Static site** | Nothing to build. If the site lives in a subfolder, set `source: public`. → [example](examples/static/shipr.yml) |
+| **PHP** | No build. Set `protect: ["uploads/**", "config.php"]`. Run `composer install` locally as a build command, or on the server in `remote_after`. → [example](examples/php/shipr.yml) |
+| **React / Vue (Vite, CRA)** | `build: {commands: ["npm ci", "npm run build"], output: dist}`. Create React App writes to `build`. → [example](examples/react/shipr.yml) |
+| **Node.js API** | Upload the source, then `remote_after: ["npm ci --omit=dev", "pm2 reload app"]`. → [example](examples/node/shipr.yml) |
+| **Next.js** | For a static export, build locally with `output: out`. For server mode, upload the source and build in `remote_after`. → [example](examples/nextjs/shipr.yml) |
+| **Monorepo** | Put `shipr.yml` in the app's folder, or set `source: apps/web`. |
+
+### Where shipr keeps its records
+
+Everything lives in `state_path` on the server, so every teammate sees the same state:
+
+```
+.shipr/manifest.json            what is deployed: each file's hash, size and time, plus the commit
+.shipr/lock                     present while a deploy runs
+.shipr/history/<id>.json        one record per deploy (who, when, commit, every file)
+.shipr/backups/<id>/...         server copies saved before overwriting or deleting
+```
+
+If `state_path` is inside `remote_path`, shipr writes a `.htaccess` that denies web access
+(Apache). On nginx, either deny `/.shipr` in the server config or set `state_path` outside the web
+root, for example `/home/deploy/.shipr/my-app`. Backups are never deleted automatically.
+
+## Commands
+
+Every command accepts `-c/--config FILE`. `-e/--env NAME` picks the environment; you can leave it
+out when `shipr.yml` defines only one.
+
+### `shipr init`
+Writes a commented `shipr.yml` in the current folder. It looks at `package.json` or
+`composer.json` only to pre-fill a sensible build step.
+
+| Option | |
+|---|---|
+| `--force` | Overwrite an existing `shipr.yml` |
+
+### `shipr validate`
+Loads and checks the configuration of every environment: unknown keys, invalid paths and missing
+`${VARIABLES}`. It does not connect to anything.
+
+### `shipr test -e ENV`
+Connects to the server and reports:
+- the host key fingerprint and your login directory
+- write access to the state directory
+- how many files are in `remote_path`
+- whether shell commands are available
+
+| Option | |
+|---|---|
+| `--trust` | Accept an unknown host key and remember it in shipr's `known_hosts` (next to the global config). Verify the printed fingerprint! |
+
+### `shipr deploy -e ENV`
+Exports the commit, builds, plans, asks, uploads and records.
+
+| Option | |
+|---|---|
+| `--ref REF` | Branch, tag or commit to deploy (default: the environment's `branch`, else `HEAD`) |
+| `-n, --dry-run` | Show the plan and change nothing (no lock, no writes) |
+| `-y, --yes` | Answer yes to the production confirmation and to deletions. Required when not in a terminal. |
+| `--no-delete` | Never delete remote files in this run; they stay on the server and are offered again next time |
+| `--trust` | As for `test` |
+
+```bash
+shipr deploy -e staging                   # deploy the env's branch (or HEAD)
+shipr deploy -e production --dry-run      # preview only
+shipr deploy -e staging --ref v1.4.2      # a tag
+shipr deploy -e staging --ref 3f2a9c1     # a specific commit
+shipr deploy -e production --yes          # non-interactive (CI)
+```
+
+### `shipr status -e ENV`
+Shows the deployed commit and branch, whether your branch has moved since, any interrupted deploy
+or held lock, and **drift**: files changed or deleted on the server since the last deploy.
+
+### `shipr history -e ENV`
+Lists past deploys: id, kind, status, commit, branch, number of files uploaded (↑), deleted (✗)
+and failed (!), and who ran it.
+
+| Option | |
+|---|---|
+| `-n N` | How many recent deploys to list (default 20) |
+| `--show ID` | Print one deploy record in full (JSON, including every file) |
+
+### `shipr rollback -e ENV`
+Redeploys an earlier commit through the normal pipeline, so only the files that differ change
+back. Repeated rollbacks keep stepping further back. The commit must exist in your local repo
+(`git fetch` first).
+
+| Option | |
+|---|---|
+| `--to ID\|COMMIT` | A deploy id, or a commit prefix, from `shipr history` (default: the previous deploy) |
+| `-n`, `-y`, `--no-delete` | As for `deploy` |
+
+### `shipr unlock -e ENV`
+Removes the deploy lock left by a deploy that was killed hard (power loss, `kill -9`). Use it only
+when no deploy is running.
+
+| Option | |
+|---|---|
+| `-y, --yes` | Don't ask for confirmation |
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Success, nothing to do, or dry run |
+| `1` | Error: config, git, connection, lock, or a command that failed |
+| `2` | Wrong command-line usage |
+| `3` | Cancelled at a confirmation |
+| `4` | Partial deploy: some files failed. Run deploy again to retry them. |
+| `130` | Interrupted by Ctrl-C or `kill`. Progress was saved; run the command again. |
+
+## Common workflows
+
+**First deploy to a site that already exists** (uploaded earlier with FileZilla): run a normal
+deploy. Files that are already identical are adopted without uploading, and differing files are
+backed up and replaced. Files on the server that aren't in your project are left alone.
+
+**Everyday deploy:** commit, then run `shipr deploy -e staging`. Check the result, then run
+`shipr deploy -e production`.
+
+**Someone hot-fixed a file on the server:** `shipr status` lists it as drift. The next deploy backs
+it up to `.shipr/backups/<id>/` before overwriting it, and the summary says so. Copy the fix into
+your repo if you want to keep it.
+
+**Roll back:** run `shipr history -e production`, then `shipr rollback -e production` for the
+previous deploy, or add `--to <id>` for a specific one.
+
+**A deploy was interrupted** (network drop, Ctrl-C, `kill`): run the same deploy again. It reports
+the interruption and uploads only what is still missing. Only after a hard kill (`kill -9`, power
+loss) do you need `shipr unlock` first.
+
+**Deploy from CI** (GitHub Actions example):
+
+```yaml
+- run: uv tool install git+<repo-url>
+- run: shipr deploy -e production --yes
+  env:
+    SHIPR_PROD_PASSWORD: ${{ secrets.SHIPR_PROD_PASSWORD }}
+```
+
+To check the host key in CI, commit the server's verified `known_hosts` line to a file and point
+`sftp.known_hosts` at it. The path is resolved from the directory shipr runs in. Avoid `--trust`
+in CI, because it accepts whatever key the server presents.
+
+## How it works
+
+1. **Export.** `git archive` writes the chosen commit into a temp folder. Line endings are not
+   converted, so Windows and Linux upload the same bytes.
+2. **Build.** `build.commands` run there, and `build.output` is what gets deployed.
+3. **Select.** Include and exclude rules (gitignore syntax) are applied, and each file is hashed
+   with SHA-256.
+4. **Compare.** For each file, shipr compares your local file, its manifest entry, and the
+   server's current listing:
+
+   | Situation | Action |
+   |---|---|
+   | unchanged | skip |
+   | changed locally | upload |
+   | edited on the server since the last deploy | back up, then overwrite (shown in the summary) |
+   | deleted on the server | upload again |
+   | already on the server but never deployed by shipr | upload only if the contents differ (backed up first) |
+   | removed locally | ask, back up, then delete |
+   | protected and present on the server | never touched |
+   | on the server but not shipr's (uploads, logs, server-only config) | **never touched** |
+
+5. **Upload.** Each file is written to a temporary name and then renamed into place. The manifest
+   is checkpointed every 25 files, and a history record is written at the end.
+
+Step-by-step diagrams of every stage, from config loading to the exit code, are in
+[docs/FLOW.md](docs/FLOW.md).
+
+shipr compares file contents rather than Git history. So a deploy that was interrupted or only
+partly succeeded is completed by simply running it again, and a rollback is just a deploy of an
+older commit.
+
+## Safety
+
+- **Server identity.** Host keys are always checked, and an unknown host is refused until you
+  accept it with `--trust`.
+- **Secrets.** They come only from environment variables or `.env`, are never echoed, and are
+  never uploaded.
+- **Path checks.** Every path is validated before anything changes. Nothing outside `remote_path`
+  is touched, and shipr's own state directory cannot be overwritten.
+- **Deletions.** Only files shipr itself deployed can be deleted. You are always asked, and a
+  "deleted" file is really moved into a backup folder.
+- **Permissions.** A replaced file keeps the server's permissions. New files keep their executable
+  bit, and backups keep the original mode.
+- **`shipr.yml` is code.** Its commands run in a shell, the same way `package.json` scripts do.
+  Review changes to it like code.
+
+Details are in [docs/security.md](docs/security.md).
+
+## Troubleshooting
+
+| Message | What to do |
+|---|---|
+| `... is not a known host` | Run `shipr test -e ENV --trust` once and compare the fingerprint with your host's. |
+| `HOST KEY MISMATCH` | The server key changed. Confirm with your host why, then remove the old line from `known_hosts`. |
+| `authentication failed` | Check `username`, and the password or key. Check the `${VARIABLE}` is set (`shipr validate`). |
+| `could not connect` | Check the host and port and your firewall. Raise `timeout` or `retries` for slow links. |
+| `remote_path ... must be a normalised absolute directory` | Use a full path like `/home/u123/public_html`. `shipr test` prints your login directory. |
+| `server has no shell access; ... hooks skipped` | Expected on SFTP-only hosting. Set `ssh_exec: false` to skip the probe, or move the commands into `build.commands`. |
+| `another deploy holds the lock` | Wait for it. If it is dead, run `shipr unlock -e ENV`. |
+| `unknown git ref` / `commit ... is not in your local repo` | Run `git fetch`, then check the branch, tag or commit exists. |
+| `you have uncommitted changes` | Only committed content is deployed. Commit first if you want those changes live. |
+| Exit code `4` | Some files failed (shown as `FAILED path: reason`). Fix the cause (often permissions) and deploy again. |
+
+## Development
+
+```bash
+git clone <repo-url> && cd shipr
+uv sync                              # create .venv with all dev dependencies
+uv run shipr --help                  # run the CLI from source
+
+uv run ruff check src tests          # lint
+uv run pytest                        # unit, end-to-end and CLI tests (fast, no network)
+uv run pytest -m integration         # real SSH/SFTP servers in Docker (needs Docker)
+```
+
+The integration suite starts two throwaway containers on random local ports and removes them
+afterwards: `linuxserver/openssh-server` (full SSH) and `atmoz/sftp` (SFTP-only, like shared
+hosting).
+
+### Project layout
+
+```
+src/shipr/
+  cli.py        argument parsing and output only
+  engine.py     deploy + rollback orchestration (lock → plan → confirm → apply → record)
+  admin.py      status, history, unlock, connection check
+  workspace.py  git ref → exported commit → build → selected, hashed files
+  planner.py    upload/delete decisions and path checks (pure, no I/O)
+  executor.py   applies a plan; keeps the manifest and record in step per file
+  hooks.py      local and remote commands, ssh_exec policy
+  state.py      manifest, lock, history and backups on the server
+  models.py     typed, validated records stored on the server
+  config.py     shipr.yml schema, layering, ${VAR} interpolation
+  files.py      selection rules and hashing
+  gitops.py     git CLI wrapper
+  scaffold.py   `shipr init` template
+  ui.py         output/confirm callbacks and plan rendering
+  errors.py     error hierarchy (each error carries its exit code)
+  paths.py      per-user directories
+  providers/    Provider interface + registry, sftp, local
+tests/          unit/, end-to-end (local provider), CLI, integration/ (Docker)
+examples/       shipr.yml for PHP, React, Node.js, Next.js, static sites
+docs/           flow diagrams (FLOW.md), security model, provider guide, design notes (PLAN.md)
+```
+
+To add a deployment method (FTP, rsync, S3, ...), see [docs/providers.md](docs/providers.md).
+Providers are separate packages that register through an entry point; the core does not change.
+
+## Contributing, security, license
+
+- Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first.
+- Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
+- How every command works, as diagrams: [docs/FLOW.md](docs/FLOW.md).
+- The design and roadmap are in [docs/PLAN.md](docs/PLAN.md).
+- shipr is licensed under [MIT](LICENSE).

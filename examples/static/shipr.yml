@@ -1,0 +1,9 @@
+# Static website in a subfolder of the repo, deployed to shared hosting.
+version: 1
+project: {name: my-site}
+source: public          # only this folder is uploaded
+environments:
+  production:
+    remote_path: /home/u123/public_html
+    ssh_exec: false
+    sftp: {host: ftp.example.com, username: u123, password: "${SHIPR_PASSWORD}"}

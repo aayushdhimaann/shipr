@@ -1,0 +1,18 @@
+# React (Vite) SPA: build locally, upload only dist/.
+version: 1
+project: {name: my-react-app}
+build:
+  commands: ["npm ci", "npm run build"]
+  output: dist          # Create React App: build
+files:
+  exclude: ["*.map"]
+environments:
+  production:
+    branch: main
+    confirm: true
+    remote_path: /home/u123/public_html
+    ssh_exec: false     # shared hosting: SFTP only
+    sftp:
+      host: ftp.example.com
+      username: u123
+      password: "${SHIPR_PROD_PASSWORD}"   # from your shell or a git-ignored .env

@@ -1,0 +1,21 @@
+# Plain PHP site (no build). Server-only files are protected; deps installed on the server.
+version: 1
+project: {name: my-php-site}
+files:
+  exclude: ["tests/", "*.md"]
+  protect: ["uploads/**", "storage/**", "config.php"]   # created/edited on the server
+hooks:
+  # Needs SSH shell access; skipped with a warning on SFTP-only hosting.
+  remote_after: ["composer install --no-dev --optimize-autoloader"]
+defaults:
+  sftp: {username: deploy, key_file: ~/.ssh/id_ed25519}
+environments:
+  staging:
+    branch: develop
+    remote_path: /var/www/staging
+    sftp: {host: staging.example.com}
+  production:
+    branch: main
+    confirm: true
+    remote_path: /var/www/html
+    sftp: {host: example.com}

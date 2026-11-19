@@ -1,0 +1,17 @@
+# Node.js API: upload source, install and restart on the server.
+version: 1
+project: {name: my-api}
+files:
+  exclude: ["test/", "*.md"]
+hooks:
+  remote_after:
+    - npm ci --omit=dev
+    - pm2 reload my-api || pm2 start src/server.js --name my-api
+environments:
+  production:
+    branch: main
+    confirm: true
+    remote_path: /srv/my-api
+    state_path: /home/deploy/.shipr/my-api
+    sftp: {host: api.example.com, username: deploy, key_file: ~/.ssh/id_ed25519,
+           passphrase: "${SHIPR_KEY_PASSPHRASE}"}
