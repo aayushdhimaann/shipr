@@ -106,8 +106,9 @@ class Config:
         unknown = set(raw) - TOP_LEVEL_KEYS
         if unknown:
             raise ConfigError(f"{path}: unknown top-level keys: {', '.join(sorted(unknown))}")
-        self.project_name = str((raw.get("project") or {}).get("name") or self.dir.name)
-        self.environments: dict[str, Any] = raw.get("environments") or {}
+        self.project_name = str(_mapping(path, "project", raw.get("project")).get("name")
+                                or self.dir.name)
+        self.environments: dict[str, Any] = _mapping(path, "environments", raw.get("environments"))
         if not self.environments:
             raise ConfigError(f"{path}: no environments defined")
 
@@ -119,10 +120,14 @@ class Config:
             )
         project = {k: self.raw[k] for k in ("source", "build", "files", "hooks") if k in self.raw}
         merged: dict[str, Any] = {}
-        for layer in (self.global_raw.get("defaults"), project, self.raw.get("defaults"),
-                      self.environments[name]):
-            merged = deep_merge(merged, layer or {})
+        for where, layer in (("global config defaults", self.global_raw.get("defaults")),
+                             ("project settings", project),
+                             ("defaults", self.raw.get("defaults")),
+                             (f"environments.{name}", self.environments[name])):
+            merged = deep_merge(merged, _mapping(self.path, where, layer))
         merged["name"] = name
+        # checked before the commands split below, which reaches into build as a dict
+        _mapping(self.path, f"environment {name!r}: build", merged.get("build"))
         if interpolate:
             # Commands are not interpolated: an expanded secret would be echoed and stored in
             # history. Commands read variables from their environment instead.
@@ -161,6 +166,17 @@ def deep_merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
         else:
             out[k] = copy.deepcopy(v)
     return out
+
+
+def _mapping(path: Path, where: str, value: Any) -> dict[str, Any]:
+    """`value` as a dict ({} when empty), or a clean ConfigError instead of a traceback later."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        # type only, never the value: it may hold a literal secret (see hide_input_in_errors)
+        raise ConfigError(f"{path}: {where} must be a mapping of keys, not a "
+                          f"{type(value).__name__}")
+    return value
 
 
 def _interpolate(value: Any, variables: dict[str, str]) -> Any:

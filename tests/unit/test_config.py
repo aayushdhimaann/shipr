@@ -57,6 +57,28 @@ def test_remote_path_must_be_safe(tmp_path, bad):
         make(tmp_path, raw).env("prod")
 
 
+@pytest.mark.parametrize("raw, global_raw, where", [
+    ({**BASE, "build": "npm run build"}, None, "build"),
+    ({"environments": {"prod": {"remote_path": "/w", "build": ["npm ci"]}}}, None, "build"),
+    ({**BASE, "defaults": "sftp"}, None, "defaults"),
+    ({"environments": {"prod": "/var/www"}}, None, "environments.prod"),
+    (BASE, {"defaults": ["x"]}, "global config defaults"),
+])
+def test_non_mapping_sections_are_config_errors(tmp_path, raw, global_raw, where):
+    # used to escape as AttributeError/TypeError tracebacks from deep_merge or build.pop
+    with pytest.raises(ConfigError, match=f"{where} must be a mapping"):
+        make(tmp_path, raw, global_raw).env("prod")
+
+
+@pytest.mark.parametrize("raw, where", [
+    ({**BASE, "project": "demo"}, "project"),
+    ({"environments": ["prod", "staging"]}, "environments"),
+])
+def test_non_mapping_top_level_sections_are_config_errors(tmp_path, raw, where):
+    with pytest.raises(ConfigError, match=f"{where} must be a mapping"):
+        make(tmp_path, raw)
+
+
 def test_unknown_keys_rejected(tmp_path):
     with pytest.raises(ConfigError, match="unknown top-level"):
         make(tmp_path, {**BASE, "deploy": {}})
