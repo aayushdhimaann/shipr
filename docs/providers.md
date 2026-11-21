@@ -35,6 +35,14 @@ Then call the base class's `_ensure_dirs`, `_check_dirs` and `_check_target` imm
 each request that writes, renames or deletes, as `sftp.py` and `local.py` do. Never cache the
 result of a check.
 
+### Retries and lost replies
+
+A request can succeed on the server while its reply is lost. If your provider retries after
+reconnecting, repeat only operations whose effect is the same when done twice: reads, uploads
+via temp file and rename, mkdir. For `rename` and `delete`, check the target first. Raise
+`AmbiguousOperation` (a `ProviderError`) when you can't prove what happened. Never guess,
+and never undo. The executor records it as a failed file and the deploy continues.
+
 Import the error types from `shipr.providers.base` (they are defined in `shipr.errors`).
 Raise `ConnectionLost` when the connection dropped and your retries are exhausted. The engine then
 stops instead of trying the remaining files. For other per-file errors, raise `OSError` or

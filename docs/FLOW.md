@@ -228,15 +228,24 @@ flowchart LR
   dead -- "no: real error<br/>(permission, not found)" --> up["raised to the caller<br/>(executor records a failed file)"]
   dead -- yes --> rl{"retries left?"}
   rl -- yes --> rc["back off, reconnect"]
-  rc --> run
+  rc --> again{"what kind of op?"}
+  again -- "read, upload, mkdir, lock create" --> run
+  again -- "rename, delete" --> rec["check what the server holds first<br/>(the lost attempt may have happened)"]
+  rec -- "provably done" --> res
+  rec -- "provably not done" --> run
+  rec -- "can't tell" --> amb["AmbiguousOperation<br/>nothing repeated or undone"]
   rl -- no --> cl["ConnectionLost<br/>deploy stops, progress is saved"]
   classDef err fill:#d23f4520,stroke:#d23f45
   classDef srv fill:#0e8f7f24,stroke:#0e8f7f
-  class cl err
+  class cl,amb err
   class run,rc srv
 ```
 
 - **Fresh client per attempt.** Each operation receives the live SFTP client as an argument, so a retry can never reuse a handle to a closed connection.
+- **A lost reply isn't a failed request.** The server may have carried out a request whose reply never arrived.
+  - **Repeated as-is:** reads, uploads (the whole temp-file-and-swap runs again), directory creation, and lock creation (the existing lock is compared with shipr's own content).
+  - **Delete:** a file that is gone after a reconnect counts as deleted. On a first attempt, a missing file is still an error.
+  - **Rename (delete-to-backup):** shipr records the source's size and its `sha256sum` hash before moving. After a lost reply, the move counts as done only if the source is gone and the destination has the same size and hash. If the source is still there and the destination absent, the move is redone. Anything else raises `AmbiguousOperation` and leaves both paths untouched: both or neither exist, the content differs, or the server can't run `sha256sum`. The executor records it as a failed file. All these checks keep the symlink guards.
 
 ## Stage 4: Lock and plan
 

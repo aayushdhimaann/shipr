@@ -422,8 +422,10 @@ your repo if you want to keep it.
 previous deploy, or add `--to <id>` for a specific one.
 
 **A deploy was interrupted** (network drop, Ctrl-C, `kill`): run the same deploy again. It reports
-the interruption and uploads only what is still missing. Only after a hard kill (`kill -9`, power
-loss) do you need `shipr unlock` first.
+the interruption and uploads only what is still missing. After a hard kill (`kill -9`, power
+loss), or a network that never came back during the deploy, the lock is still on the server.
+shipr won't guess that its holder is dead, so check that no deploy is running, then run
+`shipr unlock` first.
 
 **Deploy from CI** (GitHub Actions example):
 
@@ -521,6 +523,7 @@ Details are in [docs/security.md](docs/security.md).
 | `remote_path ... must be a normalised absolute directory` | Use a full path like `/home/u123/public_html`. `shipr test` prints your login directory. |
 | `server has no shell access; ... hooks skipped` | Expected on SFTP-only hosting. Set `ssh_exec: false` to skip the probe, or move the commands into `build.commands`. |
 | `another deploy holds the lock` | Wait for it. If it is dead, run `shipr unlock -e ENV`. |
+| `could not confirm whether moving ... completed` | The connection dropped mid-delete, and shipr couldn't prove whether the file reached its backup folder. Nothing was repeated or undone. Check both paths it names, then deploy again. |
 | `unknown git ref` / `commit ... is not in your local repo` | Run `git fetch`, then check the branch, tag or commit exists. |
 | `you have uncommitted changes` | Only committed content is deployed. Commit first if you want those changes live. |
 | Exit code `4` | Some files failed (shown as `FAILED path: reason`). Fix the cause (often permissions) and deploy again. |

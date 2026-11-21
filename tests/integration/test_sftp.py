@@ -1,5 +1,6 @@
 import uuid
 
+import paramiko
 import pytest
 
 from shipr import admin, config, engine
@@ -343,3 +344,117 @@ def test_pin_wins_over_a_stale_known_hosts_entry(project, ssh_server):
     configure(project, ssh_server, f"      password: {PASSWORD}\n", host_key=fp)
     with provider(project, trust=False) as p:
         assert p.host_fingerprint.endswith(fp)
+
+
+# --- lost replies and dead connections (Phase 3A: C-8) ------------------------------------------
+def drop_after(monkeypatch, p, method):
+    """The next `method` call runs on the real server, then the connection dies before shipr
+    sees the reply (as if the network failed at exactly that moment)."""
+    real = getattr(paramiko.SFTPClient, method)
+    done = []
+
+    def lossy(self, *args, **kwargs):
+        result = real(self, *args, **kwargs)
+        if not done:
+            done.append(args)
+            p.client.get_transport().close()
+            raise EOFError("connection dropped before the reply arrived")
+        return result
+    monkeypatch.setattr(paramiko.SFTPClient, method, lossy)
+    return done
+
+
+def backup_paths(remote):
+    import posixpath
+
+    parent, name = posixpath.split(remote)
+    return f"{remote}/old.txt", f"{parent}/.shipr/{name}/backups/id/old.txt"
+
+
+def test_lost_rename_reply_is_confirmed_by_hash(project, ssh_server, tmp_path, monkeypatch):
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n")
+    src, dst = backup_paths(remote)
+    f = tmp_path / "f"
+    f.write_text("content of a deleted file")
+    with provider(project) as p:
+        p.upload(f, src)
+        dropped = drop_after(monkeypatch, p, "rename")
+        p.rename(src, dst)  # used to fail: FileNotFoundError on the retry
+        assert len(dropped) == 1
+        assert p.stat(src) is None and p.read_text(dst) == "content of a deleted file"
+
+
+def test_lost_rename_reply_without_sha256sum_is_ambiguous(project, sftp_only_server, tmp_path,
+                                                          monkeypatch):
+    from shipr.errors import AmbiguousOperation
+
+    remote = configure(project, sftp_only_server, f"      password: {PASSWORD}\n")
+    src, dst = backup_paths(remote)
+    f = tmp_path / "f"
+    f.write_text("x")
+    with provider(project) as p:
+        p.upload(f, src)
+        drop_after(monkeypatch, p, "rename")
+        with pytest.raises(AmbiguousOperation, match="can't run sha256sum"):
+            p.rename(src, dst)
+        assert p.stat(src) is None and p.read_text(dst) == "x"  # left exactly as found
+
+
+def test_lost_delete_and_lock_release_replies(project, ssh_server, tmp_path, monkeypatch):
+    from shipr.state import RemoteState
+
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n")
+    f = tmp_path / "f"
+    f.write_text("x")
+    with provider(project) as p:
+        p.upload(f, f"{remote}/x.txt")
+        drop_after(monkeypatch, p, "remove")
+        p.delete(f"{remote}/x.txt")
+        assert p.stat(f"{remote}/x.txt") is None
+        monkeypatch.undo()
+        state = RemoteState(p, load_env(project.repo)[1].effective_state_path, remote)
+        state.acquire_lock("deploy-1")
+        drop_after(monkeypatch, p, "remove")
+        state.release_lock("deploy-1")  # used to raise on the retry
+        assert state.read_lock() is None
+
+
+def test_permanent_disconnect_mid_deploy_fails_safely(project, ssh_server, monkeypatch):
+    from shipr import admin
+    from shipr.errors import ConnectionLost, LockedError
+    from shipr.providers.sftp import SFTPProvider
+
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n")
+    for i in range(5):
+        project.write(f"f{i}.txt", f"v{i}")
+    project.commit()
+    with provider(project, trust=True):
+        pass
+    real_put, real_connect, puts = paramiko.SFTPClient.put, SFTPProvider._connect_once, []
+
+    def put_then_die(self, local, path, *a, **k):
+        if "/.shipr/" not in path:
+            puts.append(path)
+            if len(puts) == 3:  # the network goes away for good mid-deploy
+                self.get_channel().get_transport().close()
+                monkeypatch.setattr(SFTPProvider, "_connect_once",
+                                    lambda prov: (_ for _ in ()).throw(OSError("unreachable")))
+                raise EOFError("connection dropped")
+        return real_put(self, local, path, *a, **k)
+    monkeypatch.setattr(paramiko.SFTPClient, "put", put_then_die)
+    with pytest.raises(ConnectionLost):
+        helpers.deploy(project.repo)
+    monkeypatch.setattr(paramiko.SFTPClient, "put", real_put)
+    monkeypatch.setattr(SFTPProvider, "_connect_once", real_connect)
+
+    env = load_env(project.repo)[1]
+    with pytest.raises(LockedError):  # the lock couldn't be released: never guessed stale
+        helpers.deploy(project.repo)
+    assert admin.unlock(env)
+    ui = RecordingUI()
+    rec = helpers.deploy(project.repo, ui)
+    assert rec.status == "success" and "interrupted" in ui.text
+    with provider(project) as p:
+        assert {k: p.read_text(f"{remote}/{k}") for k in p.walk(remote)} == {
+            f"f{i}.txt": f"v{i}" for i in range(5)}
+    assert set(admin.status(env, "demo").manifest.files) == {f"f{i}.txt" for i in range(5)}

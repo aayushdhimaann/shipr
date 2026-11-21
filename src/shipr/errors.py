@@ -43,5 +43,10 @@ class ExecNotSupported(ProviderError):
     pass
 
 
+class AmbiguousOperation(ProviderError):
+    """The connection dropped before the server confirmed an operation, and shipr cannot prove
+    whether it happened. Nothing was repeated or undone: the paths are left as they are."""
+
+
 class ConnectionLost(ProviderError):
     """The connection dropped and retries were exhausted: stop, don't try further files."""

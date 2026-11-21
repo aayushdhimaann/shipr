@@ -58,6 +58,21 @@
   Otherwise shipr downloads and hashes the files itself, so a crafted file name can no longer
   forge another file's hash (C-16).
 
+### Network failures (Phase 3A)
+
+- A rename or delete that the server carried out, but whose reply was lost when the connection
+  dropped, is no longer retried blindly and reported as failed. After reconnecting, shipr checks
+  the server:
+  - A delete counts as done if the file is gone.
+  - A delete-to-backup rename counts as done only if the backup has the size and `sha256sum`
+    hash the file had before the move.
+  - When shipr can't prove the outcome (for example the server can't run `sha256sum`), it
+    reports the new `AmbiguousOperation` error and leaves both paths as they are.
+- Lock release no longer warns spuriously after a lost reply.
+- A connection that never comes back still stops the deploy with `ConnectionLost`, keeps the
+  lock and the interrupted-deploy marker, and repeats nothing. The next deploy, after
+  `shipr unlock`, finishes the job.
+
 ### Breaking changes
 
 - **`--trust` needs a terminal.** CI jobs that ran `deploy --trust` must pin `sftp.host_key`

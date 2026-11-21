@@ -214,3 +214,51 @@ def make_provider(server: FakeServer, roots=("/w", "/w/.shipr")) -> SFTPProvider
     p._alive = lambda: True  # a raised OSError is a real SFTP error, not a dropped connection
     p.roots = roots
     return p
+
+
+def give_shell(provider: SFTPProvider, server: FakeServer) -> None:
+    """A remote shell that understands the probe and `sha256sum -- <paths>` (GNU format)."""
+    import hashlib
+    import shlex
+
+    def exec_(command, cwd=None, timeout=None):
+        if command == "echo shipr-ok":
+            return 0, "shipr-ok\n", ""
+        args = shlex.split(command)
+        assert args[:2] == ["sha256sum", "--"], command
+        out, code = [], 0
+        for path in args[2:]:
+            node = server.nodes.get(server._resolve(path, True))
+            if not node or node[0] != "file":
+                code = 1
+                continue
+            out.append(f"{hashlib.sha256(node[1]).hexdigest()}  {path}\n")
+        return code, "".join(out), ""
+    provider.exec = exec_
+    provider._exec_ok = True
+
+
+def lose_reply(server: FakeServer, op: str, times: int = 1, before: bool = False) -> list:
+    """Make `op` drop the connection `times` times: after the server applied it (the reply is
+    lost) or, with before=True, before it reached the server. Returns a list of the calls."""
+    real = getattr(server, op)
+    calls: list = []
+
+    def wrapper(*args, **kwargs):
+        calls.append(args)
+        if len(calls) <= times and before:
+            raise EOFError("connection dropped before the request arrived")
+        result = real(*args, **kwargs)
+        if len(calls) <= times:
+            raise EOFError("connection dropped: reply lost")
+        return result
+    setattr(server, op, wrapper)
+    return calls
+
+
+def reconnecting(provider: SFTPProvider, retries: int = 2) -> SFTPProvider:
+    """Reconnects instantly to the same fake server (state survives, like a real server)."""
+    provider.cfg.retries = retries
+    provider._backoff = staticmethod(lambda attempt: None)
+    provider._connect_once = lambda: None
+    return provider

@@ -14,9 +14,16 @@ from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar
 
 # re-exported: provider authors import these from here
-from ..errors import ConnectionLost, ExecNotSupported, ProviderError, UnsafePath
+from ..errors import (
+    AmbiguousOperation,
+    ConnectionLost,
+    ExecNotSupported,
+    ProviderError,
+    UnsafePath,
+)
 
-__all__ = ["ConnectionLost", "ExecNotSupported", "Provider", "ProviderError", "RemoteStat",
+__all__ = ["AmbiguousOperation", "ConnectionLost", "ExecNotSupported", "Provider",
+           "ProviderError", "RemoteStat",
            "UnsafePath", "is_within", "leftover_of", "park_name", "tmp_name"]
 
 

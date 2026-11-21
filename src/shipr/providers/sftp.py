@@ -23,7 +23,7 @@ from typing import Any, TypeVar
 import paramiko
 from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, field_validator
 
-from ..errors import ConnectionLost, ProviderError, UnsafePath
+from ..errors import AmbiguousOperation, ConnectionLost, ProviderError, UnsafePath
 from ..paths import app_dir
 from .base import Provider, RemoteStat, park_name, tmp_name
 
@@ -167,6 +167,7 @@ class SFTPProvider(Provider):
         self._sftp: paramiko.SFTPClient | None = None
         self._exec_ok: bool | None = None
         self.host_fingerprint = ""
+        self._reconnected = False  # set by _retry: an earlier attempt of this op may have run
 
     # connection ------------------------------------------------------------
     def connect(self) -> None:
@@ -242,9 +243,13 @@ class SFTPProvider(Provider):
         """Run `op(sftp)`; if the connection drops, reconnect and run it again.
 
         `op` receives the *current* client on each attempt, so nothing keeps a handle to a
-        dead connection across a reconnect.
+        dead connection across a reconnect. A dropped connection can hide a request the server
+        already carried out (only its reply was lost), so `self._reconnected` tells an op that
+        an earlier attempt may have happened: reads, uploads and directory creation simply run
+        again; rename and delete check what the server holds before acting (see below).
         """
         for attempt in range(self.cfg.retries + 1):
+            self._reconnected = attempt > 0
             try:
                 if self._sftp is None:
                     raise ConnectionError("not connected")
@@ -409,12 +414,26 @@ class SFTPProvider(Provider):
     def delete(self, path: str) -> None:
         def op(sftp: paramiko.SFTPClient) -> None:
             if not self._usable(path):
+                if self._reconnected:
+                    return  # absent is the goal: an earlier attempt's reply was lost
                 raise FileNotFoundError(path)
             sftp.remove(path)
         self._retry(op)
 
     def rename(self, src: str, dst: str) -> None:
+        """Move a regular file; `dst` must not exist. Before moving, the source's size and
+        (where the server can run sha256sum) hash are recorded, so that after a lost reply the
+        move counts as done only if `dst` provably holds the same content and `src` is gone.
+        Anything else raises AmbiguousOperation and leaves both paths untouched."""
+        def fingerprint(sftp: paramiko.SFTPClient) -> tuple[int, str | None]:
+            if not self._usable(src):
+                raise FileNotFoundError(src)
+            return sftp.lstat(src).st_size or 0, self._sha256sum([src]).get(src)
+        before = self._retry(fingerprint)
+
         def op(sftp: paramiko.SFTPClient) -> None:
+            if self._reconnected and self._renamed(src, dst, before):
+                return
             if not self._usable(src):
                 raise FileNotFoundError(src)
             self._ensure_dirs(dst)
@@ -422,6 +441,33 @@ class SFTPProvider(Provider):
                 raise FileNotFoundError(src)
             sftp.rename(src, dst)  # plain SFTP rename refuses to overwrite: intended
         self._retry(op)
+
+    def _renamed(self, src: str, dst: str, before: tuple[int, str | None]) -> bool:
+        """After a lost reply: True if the move provably happened, False if it provably
+        didn't (so it is safe to do now); otherwise AmbiguousOperation. Never guesses."""
+        here = self._check_dirs(src) and self._lkind(src)  # guards: UnsafePath on a symlink
+        there = self._check_dirs(dst) and self._lkind(dst)
+        if here == "file" and not there:
+            return False
+        if not here and there == "file":
+            size, digest = before
+            if digest is None:
+                why = "the server can't run sha256sum, so the moved content can't be checked"
+            elif self._sftp.lstat(dst).st_size != size or \
+                    self._sha256sum([dst]).get(dst) != digest:
+                why = f"{dst} doesn't hold the content {src} had"
+            else:
+                return True
+        elif here and there:
+            why = f"both {src} and {dst} exist"
+        elif not here and not there:
+            why = f"neither {src} nor {dst} exists"
+        else:
+            why = f"{src if here else dst} is not a regular file"
+        raise AmbiguousOperation(
+            f"could not confirm whether moving {src} to {dst} completed: the connection dropped "
+            f"before the server replied, and {why}. Nothing was repeated or undone; check both "
+            "paths, then deploy again.")
 
     def rmdir_if_empty(self, path: str) -> bool:
         def op(sftp: paramiko.SFTPClient) -> bool:
@@ -475,12 +521,21 @@ class SFTPProvider(Provider):
         return stdout.channel.recv_exit_status(), out, err
 
     def sha256(self, paths: list[str]) -> dict[str, str]:
-        """Hash with `sha256sum` over SSH where possible, else by downloading. The output is
-        trusted only when it is exactly one `<64 hex>  <path>` line per requested path, in
-        order, with exit status 0: a crafted file name (BusyBox doesn't escape newlines), an
-        unreadable file or a missing binary all make the batch fall back to downloading."""
+        """Hash with `sha256sum` over SSH where possible, else by downloading."""
+        out = self._sha256sum(paths)
+        missing = [p for p in paths if p not in out]
+        if missing:
+            out.update(super().sha256(missing))
+        return out
+
+    def _sha256sum(self, paths: list[str]) -> dict[str, str]:
+        """Hashes from the server's `sha256sum`, without any download fallback (paths it
+        can't vouch for are simply missing). The output is trusted only when it is exactly one
+        `<64 hex>  <path>` line per requested path, in order, with exit status 0: a crafted
+        file name (BusyBox doesn't escape newlines), an unreadable file or a missing binary
+        all make the batch count as unhashed."""
         if not paths or not self.can_exec():
-            return super().sha256(paths)
+            return {}
         out: dict[str, str] = {}
         plain = [p for p in paths if "\n" not in p and "\\" not in p]  # never escaped
         for i in range(0, len(plain), SHA256_BATCH):
@@ -492,9 +547,6 @@ class SFTPProvider(Provider):
             digests = [_sha256_line(line, path) for line, path in zip(lines, batch, strict=True)]
             if all(digests):
                 out.update(zip(batch, digests, strict=True))
-        missing = [p for p in paths if p not in out]
-        if missing:
-            out.update(super().sha256(missing))
         return out
 
     # info ------------------------------------------------------------------
