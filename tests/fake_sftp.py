@@ -31,6 +31,10 @@ class FakeServer:
         self.posix_rename_ok = posix_rename
         self.before: dict[str, object] = {}
         self.calls: list[tuple[str, str]] = []
+        # directories that are separate filesystems: a plain rename across them fails the way
+        # OpenSSH reports EXDEV ("Failure")
+        self.mounts: list[str] = []
+        self.modes_at_write: list[tuple[str, int]] = []  # (path, permission bits) per write
 
     # tree helpers for tests ------------------------------------------------
     def mkdirs(self, path: str) -> None:
@@ -137,7 +141,9 @@ class FakeServer:
         self._hook("put", remote)
         real = self._resolve(remote, True)
         self._parent_dir(real)
-        self.nodes[real] = ("file", Path(local).read_bytes(), 0o644)
+        mode = self.nodes[real][2] if self.nodes.get(real, ("",))[0] == "file" else 0o644
+        self.modes_at_write.append((remote, mode))  # created with the server's umask default
+        self.nodes[real] = ("file", Path(local).read_bytes(), mode)
 
     def get(self, remote, local):
         self._hook("get", remote)
@@ -152,11 +158,16 @@ class FakeServer:
         node = self.nodes[real]
         self.nodes[real] = ("file", node[1], mode)
 
+    def _mount(self, real: str) -> str:
+        return max((m for m in self.mounts if real.startswith(m + "/")), key=len, default="/")
+
     def _move(self, src, dst, overwrite):
         s = posixpath.join(self._parent_dir(src), posixpath.basename(src))
         d = posixpath.join(self._parent_dir(dst), posixpath.basename(dst))
         if s not in self.nodes:
             raise self._enoent(src)
+        if self._mount(s) != self._mount(d):
+            raise OSError("Failure")  # EXDEV, as OpenSSH's sftp-server reports it
         if d in self.nodes and not overwrite:
             raise OSError("Failure")
         self.nodes[d] = self.nodes.pop(s)
@@ -189,6 +200,28 @@ class FakeServer:
             raise OSError("Failure")
         del self.nodes[real]
 
+    def create_private(self, path, perm):
+        """SFTPProvider._create_private: O_CREAT|O_EXCL with `perm` in the request itself."""
+        self._hook("create", path)
+        real = posixpath.join(self._parent_dir(path), posixpath.basename(path))
+        if real in self.nodes:
+            raise OSError("Failure")
+        self.nodes[real] = ("file", b"", perm)  # exists, empty, already private
+        server = self
+
+        class W(io.BytesIO):
+            def set_pipelined(self, on=True):
+                pass
+
+            def write(self, data):
+                server.modes_at_write.append((path, server.nodes[real][2]))
+                return super().write(data)
+
+            def __exit__(self, *a):
+                server.nodes[real] = ("file", self.getvalue(), server.nodes[real][2])
+                return super().__exit__(*a)
+        return W()
+
     def open(self, path, mode="r"):
         self._hook("open", path)
         server = self
@@ -212,6 +245,7 @@ def make_provider(server: FakeServer, roots=("/w", "/w/.shipr")) -> SFTPProvider
     p = SFTPProvider({"host": "h", "username": "u", "retries": 0})
     p._sftp = server
     p._alive = lambda: True  # a raised OSError is a real SFTP error, not a dropped connection
+    p._create_private = lambda sftp, path, perm=0o600: server.create_private(path, perm)
     p.roots = roots
     return p
 

@@ -366,7 +366,7 @@ flowchart TD
   pv --> ip["manifest.in_progress = id, user, start · save"]
   ip --> ex1["executor step 1: adopt identical files,<br/>forget vanished entries"]
   ex1 --> ex2["executor step 2: each upload<br/>(see One file upload)"]
-  ex2 --> ex3["executor step 3: each approved deletion<br/>move into backups/ID/path · drop from manifest<br/>remove folders left empty, up to remote_path"]
+  ex2 --> ex3["executor step 3: each approved deletion<br/>move into backups/ID/path (across filesystems: copy,<br/>verify SHA-256, then remove) · drop from manifest<br/>remove folders left empty, up to remote_path"]
   ex3 --> cln["remove leftover temp files"]
   ex2 -. "every 25 operations" .-> ck["checkpoint manifest.json"]
   ex3 -. "every 25 operations" .-> ck
@@ -385,7 +385,8 @@ flowchart TD
 ```
 
 - **Per-file failures.** Permission denied or a full disk on one file is recorded under `failed` and the deploy carries on. Only a lost connection stops it.
-- **"Delete" is a move.** Deleted files are moved into `.shipr/backups/<deploy-id>/`, so every deletion can be undone by hand.
+- **"Delete" is a move.** Deleted files are moved into `.shipr/backups/<deploy-id>/`, so every deletion can be undone by hand. When the server can't move them there (state on another filesystem), each is copied, the copy is verified by SHA-256, and only then is the original removed.
+- **Temp files are private.** An upload's temp file is created 0600 and gets its final mode only once complete.
 
 ## One file upload
 

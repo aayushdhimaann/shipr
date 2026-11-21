@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import platform
 import subprocess
 import tarfile
 from pathlib import Path
@@ -75,14 +76,35 @@ def export(sha: str, repo: Path, dest: Path) -> None:
 
     core.autocrlf is forced off so Windows checkouts upload the same bytes as Linux ones.
     """
+    _require_extraction_filter()  # before any work
     archive = dest.parent / f"{dest.name}.tar"
     git("-c", "core.autocrlf=false", "archive", "--format=tar", "-o", str(archive), sha,
         cwd=repo)
     dest.mkdir(parents=True, exist_ok=True)
     try:
-        with tarfile.open(archive) as tar:
-            tar.extractall(dest, filter="data")  # blocks path traversal, device files, etc.
-    except (tarfile.TarError, OSError) as e:
-        raise GitError(f"cannot export {sha[:7]}: {e} (absolute or escaping symlink?)") from None
+        extract(archive, dest)
+    except GitError as e:
+        raise GitError(f"cannot export {sha[:7]}: {e}") from None
     finally:
         archive.unlink(missing_ok=True)
+
+
+def extract(archive: Path, dest: Path) -> None:
+    """Extract with tarfile's "data" filter: no absolute or ../ paths, no links leading out of
+    `dest`, no device files, no setuid bits. There is deliberately no unfiltered fallback."""
+    _require_extraction_filter()
+    try:
+        with tarfile.open(archive) as tar:
+            tar.extractall(dest, filter="data")
+    except (tarfile.TarError, OSError) as e:
+        raise GitError(f"{e} (absolute or escaping symlink?)") from None
+
+
+def _require_extraction_filter() -> None:
+    # Python 3.10.0-3.10.11 and 3.11.0-3.11.3 lack it (their extractall() has no `filter`);
+    # feature-detected, so a distribution build with the backport works too
+    if not hasattr(tarfile, "data_filter"):
+        raise GitError(
+            f"this Python ({platform.python_version()}) can't extract the git export safely: "
+            "shipr needs Python 3.10.12 or later, 3.11.4 or later, or 3.12+ (tarfile "
+            "extraction filters). Upgrade Python, then reinstall shipr.")

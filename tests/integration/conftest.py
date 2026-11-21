@@ -1,5 +1,6 @@
 """Real SSH servers in Docker. Run with: uv run pytest -m integration"""
 
+import os
 import shutil
 import socket
 import subprocess
@@ -10,6 +11,8 @@ import paramiko
 import pytest
 
 PASSWORD = "s3cret-pw"
+# the docker CLI's own environment (HOME: its context), before tests isolate HOME
+DOCKER_ENV = dict(os.environ)
 PASSPHRASE = "key-pass"
 
 
@@ -37,7 +40,7 @@ def wait_ssh(port: int, timeout: float = 90) -> None:
 def docker_run(args: list[str]) -> str:
     name = f"shipr-test-{uuid.uuid4().hex[:8]}"
     subprocess.run(["docker", "run", "-d", "--rm", "--name", name, *args], check=True,
-                   capture_output=True)
+                   capture_output=True, env=DOCKER_ENV)
     return name
 
 
@@ -51,11 +54,13 @@ def keypair(tmp_path_factory):
 
 @pytest.fixture(scope="session")
 def ssh_server(keypair):
-    """Full SSH (shell + SFTP). Writable home: /config."""
+    """Full SSH (shell + SFTP). Writable home: /config. /xfs is a separate filesystem (tmpfs),
+    for state on another filesystem than the site (P-1)."""
     if not shutil.which("docker"):
         pytest.skip("docker not available")
     port = free_port()
     name = docker_run(["-p", f"127.0.0.1:{port}:2222", "-e", "PUID=1000", "-e", "PGID=1000",
+                       "--tmpfs", "/xfs:uid=1000,gid=1000,mode=0755",
                        "-e", "USER_NAME=deploy", "-e", f"USER_PASSWORD={PASSWORD}",
                        "-e", "PASSWORD_ACCESS=true", "-e", f"PUBLIC_KEY={keypair[1]}",
                        "lscr.io/linuxserver/openssh-server:latest"])
@@ -63,19 +68,22 @@ def ssh_server(keypair):
         wait_ssh(port)
         yield {"port": port, "user": "deploy", "root": "/config", "name": name}
     finally:
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, env=DOCKER_ENV)
 
 
 @pytest.fixture(scope="session")
 def sftp_only_server():
-    """SFTP-only, chrooted (like shared hosting). Writable dir: /upload."""
+    """SFTP-only, chrooted (like shared hosting). Writable dir: /upload. /xfs is a separate
+    filesystem (tmpfs)."""
     if not shutil.which("docker"):
         pytest.skip("docker not available")
     port = free_port()
-    name = docker_run(["-p", f"127.0.0.1:{port}:22", "atmoz/sftp:alpine",
+    name = docker_run(["-p", f"127.0.0.1:{port}:22",
+                       "--tmpfs", "/home/deploy/xfs:uid=1001,gid=100,mode=0755",
+                       "atmoz/sftp:alpine",
                        f"deploy:{PASSWORD}:1001::upload"])
     try:
         wait_ssh(port)
         yield {"port": port, "user": "deploy", "root": "/upload", "name": name}
     finally:
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, env=DOCKER_ENV)

@@ -136,7 +136,7 @@ def test_every_mutating_request_is_preceded_by_a_fresh_check(srv, src):
     p = make_provider(srv)
     p.upload(src, "/w/a/b/f.txt")
     p.upload(src, "/w/a/b/g.txt")  # no cache: the second upload checks again
-    for mut in ("put", "posix_rename"):
+    for mut in ("create", "posix_rename"):  # create: the temp file (P-5; was put)
         idxs = [i for i, (op, _) in enumerate(srv.calls) if op == mut]
         assert len(idxs) == 2
         for i in idxs:

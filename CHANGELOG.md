@@ -144,7 +144,28 @@
   a tag, or a rollback used to be recorded as the "branch".
 - New optional `Provider.delete_if_content(path, expected)`; the default works for any provider.
 
+### Filesystems, Python versions and temp files (Phase 3F)
+
+- With `state_path` on another filesystem than `remote_path`, every deletion used to fail
+  ("Failure" from OpenSSH, EXDEV locally) and the deploy ended partial. The file is now copied
+  into the backup folder, the copy is verified by SHA-256 against the original, and only then is
+  the original removed. An existing backup is never overwritten, a copy that doesn't match keeps
+  the original, and an interruption at any step leaves the original in place (P-1).
+- Python 3.10.0–3.10.11 and 3.11.0–3.11.3 crashed on every deploy with a `TypeError` traceback
+  (their `tarfile` has no extraction filter). They are now excluded by `requires-python`, and
+  shipr itself stops with a clear error on them before doing anything. The git export is still
+  only extracted with the `data` filter: there is no unfiltered fallback (P-2).
+- An upload's temporary file on the server is created 0600 in the open request itself, and gets
+  its final mode only once complete. It used to be created with the server's default mode
+  (often 0644), so other users on a shared host could read a 0600 file's new content while it
+  uploaded. Final modes are unchanged. The local provider does the same (P-5).
+
 ### Breaking changes
+
+- **Python 3.10.12+, 3.11.4+ or 3.12+ is required.** Earlier patch releases already failed on
+  every deploy; now they are refused up front. (pip refuses to install on them; uv's `pip
+  install` only checks the lower bound, so on 3.11.0–3.11.3 shipr installs and then stops with
+  the error above.)
 
 - **`shipr unlock --yes` no longer removes a lock on its own.** It shows the holder and exits 3.
   Use `shipr unlock --id <deploy id>` in scripts.

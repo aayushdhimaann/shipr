@@ -1,3 +1,5 @@
+import stat
+import subprocess
 import uuid
 
 import paramiko
@@ -9,7 +11,7 @@ from shipr.providers.sftp import SFTPProvider
 from tests import helpers
 from tests.helpers import RecordingUI, load_env
 
-from .conftest import PASSPHRASE, PASSWORD
+from .conftest import DOCKER_ENV, PASSPHRASE, PASSWORD
 
 pytestmark = pytest.mark.integration
 
@@ -430,21 +432,21 @@ def test_permanent_disconnect_mid_deploy_fails_safely(project, ssh_server, monke
     project.commit()
     with provider(project, trust=True):
         pass
-    real_put, real_connect, puts = paramiko.SFTPClient.put, SFTPProvider._connect_once, []
+    real_put, real_connect, puts = SFTPProvider._create_private, SFTPProvider._connect_once, []
 
-    def put_then_die(self, local, path, *a, **k):
+    def put_then_die(sftp, path, *a, **k):  # creating the temp file of an upload
         if "/.shipr/" not in path:
             puts.append(path)
             if len(puts) == 3:  # the network goes away for good mid-deploy
-                self.get_channel().get_transport().close()
+                sftp.get_channel().get_transport().close()
                 monkeypatch.setattr(SFTPProvider, "_connect_once",
                                     lambda prov: (_ for _ in ()).throw(OSError("unreachable")))
                 raise EOFError("connection dropped")
-        return real_put(self, local, path, *a, **k)
-    monkeypatch.setattr(paramiko.SFTPClient, "put", put_then_die)
+        return real_put(sftp, path, *a, **k)
+    monkeypatch.setattr(SFTPProvider, "_create_private", staticmethod(put_then_die))
     with pytest.raises(ConnectionLost):
         helpers.deploy(project.repo)
-    monkeypatch.setattr(paramiko.SFTPClient, "put", real_put)
+    monkeypatch.setattr(SFTPProvider, "_create_private", staticmethod(real_put))
     monkeypatch.setattr(SFTPProvider, "_connect_once", real_connect)
 
     env = load_env(project.repo)[1]
@@ -709,3 +711,84 @@ def test_lock_takeover_and_unlock_over_sftp(project, ssh_server):
         admin.unlock(env, RecordingUI(answers=[False]))
     assert admin.unlock(env, RecordingUI(), "deploy-B").startswith("removed lock")
     assert deploy(project, yes=True).status == "success"
+
+
+# --- state on another filesystem (Phase 3F: P-1) ------------------------------------------------
+def device(server, path):
+    r = subprocess.run(["docker", "exec", server["name"], "stat", "-c", "%d", path],
+                       capture_output=True, text=True, env=DOCKER_ENV)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+@pytest.mark.parametrize("server_fixture, xfs", [("ssh_server", "/xfs"),
+                                                 ("sftp_only_server", "/home/deploy/xfs")])
+def test_deletion_with_state_on_another_filesystem(project, request, server_fixture, xfs):
+    server = request.getfixturevalue(server_fixture)
+    state = f"/xfs/state-{uuid.uuid4().hex[:6]}"  # (inside the chroot for the SFTP-only server)
+    remote = configure(project, server, f"      password: {PASSWORD}\n",
+                       extra_env=f"    state_path: {state}\n")
+    in_container = server["root"] if server_fixture == "ssh_server" else "/home/deploy/upload"
+    assert device(server, in_container) != device(server, xfs)  # really two filesystems
+    project.write("keep.txt", "k")
+    project.write("old/gone.txt", "bye")
+    project.commit()
+    assert deploy(project).status == "success"
+    (project.repo / "old" / "gone.txt").unlink()
+    project.commit()
+    ui = RecordingUI()
+    rec = deploy(project, ui=ui, yes=True)
+    assert rec.status == "success" and not rec.failed, rec.failed  # was: partial, "Failure"
+    assert "another filesystem" in ui.text
+    with provider(project) as p:
+        assert p.stat(f"{remote}/old/gone.txt") is None
+        assert p.read_text(rec.deleted[0].backup) == "bye"
+
+
+# --- temp file permissions (Phase 3F: P-5) -------------------------------------------------------
+def watch_writes(monkeypatch):
+    """Permission bits of every uploaded file at its first write, as the server reports them.
+    Not the lock (opened "wx" by create_exclusive): it holds no deployment data."""
+    seen = []
+    real_write, real_open = paramiko.SFTPFile.write, paramiko.SFTPClient.open
+
+    def open_(self, path, mode="r", *a, **k):
+        f = real_open(self, path, mode, *a, **k)
+        f.shipr_watched = "x" in mode  # the lock: not watched
+        return f
+
+    def write(self, data):
+        if not getattr(self, "shipr_watched", False):
+            self.shipr_watched = True
+            seen.append(stat.S_IMODE(self.stat().st_mode))
+        return real_write(self, data)
+    monkeypatch.setattr(paramiko.SFTPClient, "open", open_)
+    monkeypatch.setattr(paramiko.SFTPFile, "write", write)
+    return seen
+
+
+@pytest.mark.parametrize("server_fixture", ["ssh_server", "sftp_only_server"])
+def test_uploads_are_private_from_their_first_byte(project, request, server_fixture,
+                                                   monkeypatch):
+    server = request.getfixturevalue(server_fixture)
+    remote = configure(project, server, f"      password: {PASSWORD}\n")
+    project.write("config.php", "<?php $pw = 'v1';")
+    project.write("index.php", "<?php echo 1;")
+    project.commit()
+    assert deploy(project).status == "success"
+    with provider(project) as p:
+        p._sftp.chmod(f"{remote}/config.php", 0o600)  # the server's copy is private
+        default = stat.S_IMODE(p._sftp.lstat(f"{load_env(project.repo)[1].effective_state_path}"
+                                             "/manifest.json").st_mode)
+    project.write("config.php", "<?php $pw = 'v2';")
+    project.commit()
+    seen = watch_writes(monkeypatch)
+    assert deploy(project).status == "success"
+    assert seen and all(m == 0o600 for m in seen), seen  # was 0644 (the umask)
+    monkeypatch.undo()
+    env = load_env(project.repo)[1]
+    with provider(project) as p:
+        mode = lambda path: stat.S_IMODE(p._sftp.lstat(path).st_mode)  # noqa: E731
+        assert mode(f"{remote}/config.php") == 0o600
+        assert mode(f"{remote}/index.php") == 0o644
+        assert mode(f"{env.effective_state_path}/manifest.json") == default  # unchanged

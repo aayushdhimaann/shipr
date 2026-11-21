@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 import paramiko
+from paramiko.sftp import CMD_HANDLE, CMD_OPEN, SFTP_FLAG_CREATE, SFTP_FLAG_EXCL, SFTP_FLAG_WRITE
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 
 from ..errors import (
@@ -215,6 +216,7 @@ class SFTPProvider(Provider):
         self.host_fingerprint = ""
         self._reconnected = False  # set by _retry: an earlier attempt of this op may have run
         self._exec_problem: str | None = None  # why the shell probe gave no clear answer
+        self._default_modes: dict[str, int] = {}  # directory -> mode of a new file there
 
     @staticmethod
     def _parse(settings: dict[str, Any]) -> SFTPSettings:
@@ -443,6 +445,8 @@ class SFTPProvider(Provider):
             sftp.remove(parked)
 
     def upload(self, local: Path, remote: str, mode: int | None = None) -> RemoteStat:
+        """The temp file is created 0600 and only gets its final mode (`mode`, else the
+        server's default for a new file) once it is complete (P-5)."""
         def op(sftp: paramiko.SFTPClient) -> RemoteStat:
             self._ensure_dirs(remote)
             self._check_target(remote)
@@ -450,17 +454,63 @@ class SFTPProvider(Provider):
             tmp_kind = self._lkind(tmp)
             if tmp_kind == "dir":
                 raise UnsafePath(f"refusing {remote}: {tmp} is a directory")
-            if tmp_kind in ("symlink", "special"):
-                sftp.remove(tmp)  # removes the link itself, never its target
-            sftp.put(str(local), tmp, confirm=True)
-            if mode is not None:
-                sftp.chmod(tmp, mode)
+            if tmp_kind is not None:
+                # a link is removed itself, never its target; a file is a partial copy of a
+                # repo file from an earlier attempt: recreated, so it is private from the start
+                sftp.remove(tmp)
+            if mode is None and posixpath.dirname(tmp) not in self._default_modes:
+                self._learn_default_mode(sftp, tmp)
+                self._ensure_dirs(remote)  # fresh checks again, right before the real write
+                self._check_target(remote)
+            final = mode if mode is not None else self._default_modes[posixpath.dirname(tmp)]
+            with local.open("rb") as src, self._create_private(sftp, tmp) as f:
+                f.set_pipelined(True)
+                while chunk := src.read(32768):
+                    f.write(chunk)
+            size = local.stat().st_size
+            if (sftp.lstat(tmp).st_size or 0) != size:
+                raise OSError(f"size mismatch uploading {remote}")
+            sftp.chmod(tmp, final)
             if not self._check_dirs(remote):  # re-check right before the swap
                 raise FileNotFoundError(remote)
             self._check_target(remote)
             self._replace(sftp, tmp, remote)
             return _remote_stat(sftp.lstat(remote))
         return self._retry(op)
+
+    @staticmethod
+    def _create_private(sftp: paramiko.SFTPClient, path: str,
+                        perm: int = 0o600) -> paramiko.SFTPFile:
+        """Create `path` (O_CREAT|O_EXCL, so never through a symlink) with `perm` in the OPEN
+        request itself, so no one else can open it before its content is written. paramiko's
+        open() sends no attributes, so the request is built like open() builds it. If the
+        server ignored the mode, it is fixed before the first byte (a narrower window)."""
+        attrs = paramiko.SFTPAttributes()
+        attrs.st_mode = perm
+        kind, msg = sftp._request(CMD_OPEN, path,
+                                  SFTP_FLAG_WRITE | SFTP_FLAG_CREATE | SFTP_FLAG_EXCL, attrs)
+        if kind != CMD_HANDLE:
+            raise ProviderError(f"cannot create {path}: unexpected server reply")
+        f = paramiko.SFTPFile(sftp, msg.get_binary(), "wb")
+        try:
+            if statmod.S_IMODE(f.stat().st_mode or 0) & ~perm:
+                f.chmod(perm)
+        except BaseException:
+            f.close()
+            raise
+        return f
+
+    def _learn_default_mode(self, sftp: paramiko.SFTPClient, tmp: str) -> None:
+        """The mode the server gives a new file in tmp's directory (its umask), learned once per
+        directory from an empty probe file at the temp path, so files written without a mode
+        (shipr's records) keep the mode they always had."""
+        with sftp.open(tmp, "wx"):  # O_EXCL; empty, so there is nothing to read
+            pass
+        try:
+            self._default_modes[posixpath.dirname(tmp)] = \
+                statmod.S_IMODE(sftp.lstat(tmp).st_mode or 0o644)
+        finally:
+            sftp.remove(tmp)
 
     def download(self, remote: str, local: Path) -> None:
         def op(sftp: paramiko.SFTPClient) -> None:

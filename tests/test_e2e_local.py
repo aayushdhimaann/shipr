@@ -2,7 +2,9 @@
 
 import json
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -1243,3 +1245,78 @@ def test_branch_is_recorded_only_for_a_branch(project):
     cfg, env = load_env(project.repo)
     rec = engine.rollback(cfg, env, options=engine.DeployOptions(yes=True), ui=RecordingUI())
     assert rec.kind == "rollback" and rec.branch is None
+
+
+# --- state on another filesystem (Phase 3F: P-1) -------------------------------------------------
+def deploy_then_remove(project):
+    project.write("keep.txt", "k")
+    project.write("old/gone.txt", "bye")
+    project.commit()
+    run(project)
+    (project.repo / "old" / "gone.txt").unlink()
+    project.commit()
+
+
+def exdev_into_state(monkeypatch, project):
+    """os.rename fails like it does across filesystems, for moves into the state dir."""
+    import errno
+
+    import shipr.providers.local as local_mod
+
+    real = local_mod.os.rename
+
+    def rename(src, dst, *a, **k):
+        if ".shipr" in str(dst) and ".shipr" not in str(src):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        return real(src, dst, *a, **k)
+    monkeypatch.setattr(local_mod.os, "rename", rename)
+
+
+def test_deletion_with_state_on_another_filesystem(project, monkeypatch):
+    deploy_then_remove(project)
+    exdev_into_state(monkeypatch, project)
+    ui = RecordingUI()
+    rec = run(project, ui=ui, yes=True)
+    assert rec.status == "success" and not rec.failed, rec.failed  # was: partial, every time
+    assert not (project.site / "old" / "gone.txt").exists()
+    backup = project.server / rec.deleted[0].backup.lstrip("/")
+    assert backup.read_text() == "bye" and "copied" in ui.text
+
+
+@posix_only
+def test_deletion_with_state_on_a_real_other_filesystem(project, tmp_path):
+    shm = Path("/dev/shm")
+    if not shm.is_dir() or shm.stat().st_dev == project.server.stat().st_dev:
+        pytest.skip("needs /dev/shm on a different filesystem than the test's temp dir")
+    other = Path(tempfile.mkdtemp(dir=shm))
+    try:
+        (project.server / "st").symlink_to(other)  # above the configured root: followed
+        add_env_option(project, "state_path: /st")
+        deploy_then_remove(project)
+        rec = run(project, yes=True)
+        assert rec.status == "success" and not rec.failed, rec.failed
+        assert (other / "backups" / rec.id / "old" / "gone.txt").read_text() == "bye"
+        assert not (project.site / "old" / "gone.txt").exists()
+    finally:
+        shutil.rmtree(other, ignore_errors=True)
+
+
+def test_crash_between_copy_and_removal_loses_nothing(project, monkeypatch):
+    from shipr.providers.local import LocalProvider
+
+    deploy_then_remove(project)
+    exdev_into_state(monkeypatch, project)
+    real_delete = LocalProvider.delete
+
+    def crash(self, path):
+        if path.endswith("gone.txt"):
+            raise KeyboardInterrupt  # killed right after the verified copy
+        return real_delete(self, path)
+    monkeypatch.setattr(LocalProvider, "delete", crash)
+    with pytest.raises(KeyboardInterrupt):
+        run(project, yes=True)
+    assert (project.site / "old" / "gone.txt").read_text() == "bye"  # original still there
+    monkeypatch.setattr(LocalProvider, "delete", real_delete)
+    rec = run(project, yes=True)  # the next deploy finishes the job
+    assert rec.status == "success" and [d.path for d in rec.deleted] == ["old/gone.txt"]
+    assert not (project.site / "old" / "gone.txt").exists()

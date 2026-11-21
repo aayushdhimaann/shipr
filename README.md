@@ -64,7 +64,7 @@ success: 3 uploaded, 1 deleted, 0 failed in 2.4s (deploy id 20261119T103205123Z-
 
 | | |
 |---|---|
-| Your machine | Python 3.10+ and `git`, on Linux, macOS or Windows |
+| Your machine | Python 3.10.12+, 3.11.4+ or 3.12+, and `git`, on Linux, macOS or Windows. Older patch releases lack the safe archive extraction shipr relies on, and are refused. |
 | The server | SFTP access. SSH shell access is optional and only needed for remote hooks. |
 | For builds | Whatever your build commands need (Node.js for `npm run build`, Composer, ...) |
 
@@ -541,9 +541,12 @@ older commit.
 - **Interrupted uploads.** Leftover temp and "parked" files are only removed when shipr can
   prove they are its own and recoverable. Otherwise the deploy stops and tells you what to check.
 - **Deletions.** Only files shipr itself deployed can be deleted. You are always asked, and a
-  "deleted" file is really moved into a backup folder.
+  "deleted" file is really moved into a backup folder. If `state_path` is on another filesystem,
+  where the server can't move files into it, the file is copied there, the copy is verified by
+  hash, and only then is the original removed.
 - **Permissions.** A replaced file keeps the server's permissions. New files keep their executable
-  bit, and backups keep the original mode.
+  bit, and backups keep the original mode. While a file is being uploaded, its temporary copy is
+  readable only by the deploy user (0600) from the moment it is created.
 - **`shipr.yml` is code.** Its commands run in a shell, the same way `package.json` scripts do.
   Review changes to it like code.
 

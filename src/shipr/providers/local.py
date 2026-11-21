@@ -29,6 +29,16 @@ def _kind(st: os.stat_result) -> str:
     return "file" if statmod.S_ISREG(st.st_mode) else "special"
 
 
+def _default_mode(probe: Path) -> int:
+    """The mode a new file gets here (umask, default ACLs), from an empty probe file."""
+    fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    try:
+        return os.fstat(fd).st_mode & 0o7777
+    finally:
+        os.close(fd)
+        probe.unlink()
+
+
 class LocalProvider(Provider):
     name = "local"
 
@@ -124,11 +134,15 @@ class LocalProvider(Provider):
         tmp_kind = self._lkind(tmp)
         if tmp_kind == "dir":
             raise UnsafePath(f"refusing {remote}: {tmp} is a directory")
-        if tmp_kind in ("symlink", "special"):
-            self._p(tmp).unlink()  # unlinking removes the link itself, never its target
-        shutil.copyfile(local, self._p(tmp))
-        if mode is not None:
-            os.chmod(self._p(tmp), mode)
+        if tmp_kind is not None:  # a link itself (never its target), or an earlier partial
+            self._p(tmp).unlink()
+        final = mode if mode is not None else _default_mode(self._p(tmp))
+        # created 0600 (O_EXCL: never through a symlink), final mode only once complete (P-5)
+        fd = os.open(self._p(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | getattr(os, "O_BINARY", 0), 0o600)
+        with os.fdopen(fd, "wb") as out, local.open("rb") as src:
+            shutil.copyfileobj(src, out)
+        os.chmod(self._p(tmp), final)
         if not self._check_dirs(remote):  # re-check right before the replace
             raise FileNotFoundError(remote)
         self._check_target(remote)

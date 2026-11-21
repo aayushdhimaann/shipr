@@ -43,6 +43,10 @@ via temp file and rename, mkdir. For `rename` and `delete`, check the target fir
 `AmbiguousOperation` (a `ProviderError`) when you can't prove what happened. Never guess,
 and never undo. The executor records it as a failed file and the deploy continues.
 
+`upload` should create its temporary file readable only by the deploy user from the start (not
+chmod it after writing), and give it its final mode only once it is complete. `rename` may fail
+across filesystems; raise a plain `OSError` then, and the engine falls back to a verified copy.
+
 The deploy lock is removed with `delete_if_content(path, expected)`. The default reads the file
 and deletes it only if it still holds `expected`. If your provider retries deletes after a
 reconnect, override it to re-read before every attempt, as `sftp.py` does, so that a retry never

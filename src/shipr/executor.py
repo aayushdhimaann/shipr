@@ -32,6 +32,7 @@ class PlanExecutor:
         self.root = remote_path
         self.ui = ui
         self._ops_done = 0
+        self._copied = False  # warned that backups are copied, not moved
 
     def run(self, plan: Plan, deletes: list[Op]) -> None:
         self._apply_bookkeeping(plan)
@@ -75,11 +76,39 @@ class PlanExecutor:
     def _delete(self, op: Op) -> None:
         target = safe_join(self.root, op.path)
         backup = self.state.backup_path(self.record.id, op.path)
-        self.provider.rename(target, backup)  # "delete" = move into the backup folder
+        try:
+            self.provider.rename(target, backup)  # "delete" = move into the backup folder
+        except OSError as e:
+            # A plain OSError is what a cross-filesystem rename gives: EXDEV locally, a bare
+            # "Failure" from OpenSSH. Missing files, permissions, symlinks and unconfirmed
+            # moves (AmbiguousOperation) are other exception types, and stay failures.
+            if type(e) is not OSError:
+                raise
+            self._copy_then_remove(target, backup, e)
         self.manifest.files.pop(op.path, None)
         self.record.deleted.append(DeletedFile(path=op.path, backup=backup))
         self.ui.echo(f"  ✗ {op.path}")
         self._remove_empty_parents(target)
+
+    def _copy_then_remove(self, target: str, backup: str, why: OSError) -> None:
+        """P-1: the move into the backup folder failed, typically because state_path is on
+        another filesystem. Copy instead (the backup appears whole, via a temp file), verify it
+        by hash against the original, and only then remove the original. Until that last step
+        the original is untouched, so an interruption at any point loses nothing."""
+        if self.provider.stat(backup) is not None:
+            raise ProviderError(f"cannot move {target} to {backup} ({why}), and a file is "
+                                "already there; nothing was changed") from None
+        self.provider.copy(target, backup)
+        digest = self.provider.sha256([target, backup])
+        if not digest.get(target) or digest.get(target) != digest.get(backup):
+            raise ProviderError(f"the backup copy {backup} doesn't match {target} (changed on the "
+                                f"server while it was copied?); {target} was left in place")
+        if not self._copied:
+            self._copied = True
+            self.ui.warn(f"the server could not move deleted files into {self.state.root} "
+                         f"({why}); usually state_path is on another filesystem than "
+                         "remote_path. They are copied there, verified, then removed instead.")
+        self.provider.delete(target)
 
     def _remove_empty_parents(self, path: str) -> None:
         d = posixpath.dirname(path)
