@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
 
@@ -12,12 +11,13 @@ from .providers import Provider
 from .ui import UI
 
 
-def run_local(commands: list[str], cwd: Path, extra_env: dict[str, str], ui: UI) -> None:
+def run_local(commands: list[str], cwd: Path, env: dict[str, str], ui: UI) -> None:
+    """`env` is the commands' complete environment (workspace.command_env)."""
     for cmd in commands:
         ui.echo(f"$ {cmd}")
         # shell=True on purpose: commands come from the project's own shipr.yml, which is
         # trusted like npm scripts (see docs/security.md)
-        r = subprocess.run(cmd, shell=True, cwd=cwd, env={**os.environ, **extra_env})
+        r = subprocess.run(cmd, shell=True, cwd=cwd, env=env)
         if r.returncode != 0:
             raise DeployError(f"command failed ({r.returncode}): {cmd}")
 

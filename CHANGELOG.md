@@ -15,8 +15,11 @@
   recoverable. Unrelated `*.shipr-old` and `*.shipr-tmp` files are never deleted. A stale park
   file no longer makes the next upload of that file fail.
 
-- By default, deploy records now live beside the web root instead of inside it:
-  `/var/www/html` → `/var/www/.shipr/html`. Records inside the web root warn on every deploy.
+- By default, deploy records now go beside `remote_path` instead of inside it: `/var/www/html`
+  → `/var/www/.shipr/html`. This is outside the site only when `remote_path` is the web root
+  itself, so the first deploy to the default location warns about it. Records inside
+  `remote_path` warn on every deploy. Records in both the old and new locations (a half-finished
+  move) stop the deploy instead of being guessed between.
 
 ### Reliability
 
@@ -39,9 +42,27 @@
   hook failed. After an interrupted deploy it restores the last completed one. It refuses to
   guess when history and manifest disagree.
 
+### SSH and secrets
+
+- New `sftp.host_key` setting pins the server's key fingerprint (`SHA256:...`, or a list while
+  rotating keys). It wins over known_hosts and needs no known_hosts entry, which is what CI
+  needs.
+- `--trust` now shows the fingerprint and asks for confirmation in a terminal before saving a
+  key. Without a terminal it refuses, and `--yes` never confirms a host key. The fingerprint is
+  shown with a single `SHA256:` prefix (it was doubled), and "not a known host" errors print it.
+- `known_hosts` lines are appended in one write and not duplicated.
+- Passwords and passphrases are held as secret values that `repr()` and tracebacks don't show.
+- New `build.env` allowlist: local build commands and hooks see only the named variables plus a
+  few basics. Unset, they still see everything, as before.
+- `sha256sum` output from the server is only trusted when it matches the request exactly.
+  Otherwise shipr downloads and hashes the files itself, so a crafted file name can no longer
+  forge another file's hash (C-16).
+
 ### Breaking changes
 
-- **New default state location.** Records of new deployments go beside the web root. Existing
+- **`--trust` needs a terminal.** CI jobs that ran `deploy --trust` must pin `sftp.host_key`
+  instead. That setup accepted any key, including an attacker's.
+- **New default state location.** Records of new deployments go beside `remote_path`. Existing
   0.1 records at `<remote_path>/.shipr` keep being used, with a warning, until you move them. If
   the deploy user can't create the new default (for example `/var/www` is root-owned), the
   deploy stops before any change and asks you to set `state_path`.

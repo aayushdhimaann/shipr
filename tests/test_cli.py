@@ -68,3 +68,10 @@ def test_validate_reports_state_overlaps(tmp_path, monkeypatch):
     for args in (["validate"], ["status", "-e", "prod"], ["deploy", "-e", "staging"]):
         r = CliRunner().invoke(cli, args)
         assert r.exit_code == 1 and "same server" in r.output, (args, r.output)
+
+
+def test_host_key_trust_is_never_assumed_without_a_terminal():
+    from shipr.cli import make_ui
+
+    ui = make_ui()  # CliRunner/pytest stdin is not a TTY
+    assert ui.trust_host("h", "ssh-ed25519 SHA256:x") is False

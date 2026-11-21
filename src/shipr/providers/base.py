@@ -7,7 +7,7 @@ import re
 import secrets
 import tempfile
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -43,6 +43,8 @@ class Provider(ABC):
         # engine sets (remote_path, state_path): every path below them must be reached through
         # real directories only (see confined()); empty = no confinement
         self.roots: tuple[str, ...] = ()
+        # with trust_new_host, asked before trusting an unknown server key (host, key) -> yes?
+        self.confirm_host_key: Callable[[str, str], bool] | None = None
 
     # lifecycle -----------------------------------------------------------
     @abstractmethod

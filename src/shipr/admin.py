@@ -6,7 +6,13 @@ import posixpath
 from dataclasses import dataclass, field
 
 from .config import Environment
-from .engine import open_provider, scan_remote, state_for, state_warnings
+from .engine import (
+    default_location_warning,
+    open_provider,
+    scan_remote,
+    state_for,
+    state_warnings,
+)
 from .errors import DeployError, ProviderError
 from .hooks import remote_exec_available
 from .models import DeployRecord, Manifest
@@ -60,7 +66,7 @@ def unlock(env: Environment) -> str | None:
 
 
 def check_connection(env: Environment, trust: bool, ui: UI) -> bool:
-    with open_provider(env, trust_new_host=trust) as provider:
+    with open_provider(env, trust_new_host=trust, confirm_host_key=ui.trust_host) as provider:
         ui.echo(f"connected to {provider.describe()}")
         for line in provider.diagnostics():
             ui.echo(line)
@@ -89,6 +95,7 @@ def check_connection(env: Environment, trust: bool, ui: UI) -> bool:
             ui.echo(str(e))
             return False
         ui.echo("shell commands: " + ("available" if can else "not available (hooks skipped)"))
-        for w in state_warnings(env, state):
-            ui.echo(f"warning: {w}")
+        for w in state_warnings(env, state) + [default_location_warning(env, state)]:
+            if w:
+                ui.echo(f"warning: {w}")
         return True

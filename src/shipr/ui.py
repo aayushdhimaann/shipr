@@ -16,6 +16,9 @@ PLAN_LIST_LIMIT = 100
 class UI:
     echo: Callable[[str], None] = print
     confirm: Callable[[str], bool] = lambda _msg: False  # safe default: never assume "yes"
+    # trust an unknown server key? (host, "type SHA256:..."); separate from `confirm` so that
+    # --yes can never accept a host key
+    trust_host: Callable[[str, str], bool] = lambda _host, _key: False
 
     def warn(self, msg: str) -> None:
         self.echo(f"warning: {msg}")

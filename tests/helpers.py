@@ -10,11 +10,12 @@ from shipr.ui import UI
 class RecordingUI(UI):
     """Records output and answers confirmations from a scripted list (default: no)."""
 
-    def __init__(self, answers=()):
+    def __init__(self, answers=(), trust_hosts=False):
         self.lines: list[str] = []
         self.prompts: list[str] = []
         self.answers = list(answers)
-        super().__init__(echo=self.lines.append, confirm=self._confirm)
+        super().__init__(echo=self.lines.append, confirm=self._confirm,
+                         trust_host=lambda host, key: trust_hosts)
 
     def _confirm(self, msg: str) -> bool:
         self.prompts.append(msg)

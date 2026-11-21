@@ -35,6 +35,16 @@ class _Model(BaseModel):
 class Build(_Model):
     commands: list[str] = []
     output: str = "."
+    # names of the variables local commands (build, local hooks) may see, besides a few
+    # basics like PATH and HOME; unset = they see everything (your environment and .env)
+    env: list[str] | None = None
+
+    @field_validator("env")
+    @classmethod
+    def _names(cls, v: list[str] | None) -> list[str] | None:
+        if v is not None and not all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", n) for n in v):
+            raise ValueError("must be a list of environment variable names")
+        return v
 
 
 class Files(_Model):
@@ -96,7 +106,7 @@ class Environment(BaseModel):
 
     @property
     def effective_state_path(self) -> str:
-        """`state_path`, else beside the web root: /var/www/html -> /var/www/.shipr/html."""
+        """`state_path`, else beside remote_path: /var/www/html -> /var/www/.shipr/html."""
         if self.state_path:
             return self.state_path
         parent, name = posixpath.split(self.remote_path)

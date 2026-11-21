@@ -1,24 +1,27 @@
 """SFTP provider (paramiko).
 
 Settings: host, port=22, username, password | key_file [+ passphrase] (neither: ssh-agent),
-timeout=15, retries=3, known_hosts (extra file, optional). Host keys are always verified;
-unknown hosts are only accepted with `trust_new_host` (shipr test --trust), and saved to
-shipr's own known_hosts.
+timeout=15, retries=3, known_hosts (extra file, optional), host_key (pinned fingerprint(s)).
+Host keys are always verified. A pinned `host_key` is the trust anchor and wins over
+known_hosts. Otherwise an unknown host is only accepted with `trust_new_host` *and* an explicit
+confirmation of its fingerprint (a terminal prompt), then saved to shipr's own known_hosts.
 """
 
 from __future__ import annotations
 
+import os
 import posixpath
+import re
 import shlex
 import socket
 import stat as statmod
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TypeVar
 
 import paramiko
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, field_validator
 
 from ..errors import ConnectionLost, ProviderError, UnsafePath
 from ..paths import app_dir
@@ -35,25 +38,88 @@ class SFTPSettings(BaseModel):
     host: str
     port: int = 22
     username: str
-    password: str | None = None
+    password: SecretStr | None = None  # SecretStr: never shown by repr() or tracebacks
     key_file: str | None = None
-    passphrase: str | None = None
+    passphrase: SecretStr | None = None
     timeout: float = 15
     retries: int = 3
     known_hosts: str | None = None
+    # pinned server key fingerprint(s), as `ssh-keygen -lf` prints them; a list while rotating
+    host_key: list[str] | None = None
+
+    @field_validator("host_key", mode="before")
+    @classmethod
+    def _pins(cls, v: object) -> object:
+        pins = [v] if isinstance(v, str) else v
+        if pins is not None and not (isinstance(pins, list) and pins and all(
+                isinstance(p, str) and _PIN.fullmatch(p) for p in pins)):
+            raise ValueError("must be a fingerprint like SHA256:<43 base64 characters> (as "
+                             "printed by `ssh-keygen -lf <host key>.pub`), or a list of them")
+        return pins
 
 
-class _TrustOnFirstUse(paramiko.MissingHostKeyPolicy):
-    """Accept an unknown host key once and remember it in shipr's own known_hosts."""
+_PIN = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
 
-    def __init__(self, store: Path):
-        self.store = store
+
+def describe_key(key: paramiko.PKey) -> str:
+    """`ssh-ed25519 SHA256:...`: the form `ssh-keygen -lf` prints, to compare by eye."""
+    return f"{key.get_name()} {key.fingerprint}"  # paramiko's fingerprint includes "SHA256:"
+
+
+class _HostKeyPolicy(paramiko.MissingHostKeyPolicy):
+    """Decides about a host key that isn't in any known_hosts file.
+
+    A pin (`host_key`) decides alone. Without one, the key is trusted only when `trust` was
+    requested (--trust) *and* `confirm` (a terminal prompt showing the fingerprint) says yes;
+    it is then saved. Refusals are ProviderErrors, so the connect loop doesn't retry them.
+    """
+
+    def __init__(self, store: Path, pins: Sequence[str], trust: bool,
+                 confirm: Callable[[str, str], bool] | None):
+        self.store, self.pins, self.trust, self.confirm = store, list(pins), trust, confirm
 
     def missing_host_key(self, client, hostname, key):
+        shown = describe_key(key)
+        if self.pins:
+            if key.fingerprint not in self.pins:
+                raise _pin_mismatch(hostname, key, self.pins)
+            client.get_host_keys().add(hostname, key.get_name(), key)  # in memory only
+            return
+        pin_hint = (f"After verifying it with your server provider, pin it in shipr.yml with "
+                    f"`host_key: {key.fingerprint}` (best for CI)")
+        if not self.trust:
+            raise ProviderError(f"{hostname} is not a known host (it presented {shown}). "
+                                f"{pin_hint}, or run `shipr test -e <env> --trust` in a "
+                                "terminal to confirm and remember it.")
+        if self.confirm is None or not self.confirm(hostname, shown):
+            raise ProviderError(f"{hostname}'s host key ({shown}) was not confirmed, so it is "
+                                f"not trusted. {pin_hint}; `--trust` asks for confirmation in "
+                                "a terminal and never trusts a key on its own.")
         client.get_host_keys().add(hostname, key.get_name(), key)
-        self.store.parent.mkdir(parents=True, exist_ok=True)
-        with self.store.open("a", encoding="utf-8") as f:
-            f.write(f"{hostname} {key.get_name()} {key.get_base64()}\n")
+        _remember(self.store, f"{hostname} {key.get_name()} {key.get_base64()}\n")
+
+
+def _pin_mismatch(hostname: str, key: paramiko.PKey, pins: Sequence[str]) -> ProviderError:
+    return ProviderError(
+        f"HOST KEY MISMATCH for {hostname}: the server presented {describe_key(key)}, but "
+        f"shipr.yml pins {', '.join(pins)}. This can mean a man-in-the-middle attack. If the "
+        "server's key was rotated, verify the new fingerprint and update `host_key`.")
+
+
+def _remember(store: Path, line: str) -> None:
+    """Append one known_hosts line in a single O_APPEND write (no interleaving with another
+    shipr process on POSIX), skipping lines already present."""
+    store.parent.mkdir(parents=True, exist_ok=True)
+    existing = store.read_text(encoding="utf-8") if store.is_file() else ""
+    if line.strip() in existing.splitlines():
+        return
+    if existing and not existing.endswith("\n"):  # hand-edited: don't glue onto its last line
+        line = "\n" + line
+    fd = os.open(store, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
 
 
 def _remote_stat(a: paramiko.SFTPAttributes) -> RemoteStat:
@@ -77,6 +143,15 @@ def _attrs(sftp: paramiko.SFTPClient, path: str) -> paramiko.SFTPAttributes | No
         return sftp.stat(path)
     except FileNotFoundError:
         return None
+
+
+_SHA256_LINE = re.compile(r"([0-9a-f]{64}) [ *](.*)")
+
+
+def _sha256_line(line: str, path: str) -> str | None:
+    """The digest from one `sha256sum` output line, only if it is for exactly `path`."""
+    m = _SHA256_LINE.fullmatch(line)
+    return m.group(1) if m and m.group(2) == path else None
 
 
 class SFTPProvider(Provider):
@@ -107,10 +182,6 @@ class SFTPProvider(Provider):
                     f"HOST KEY MISMATCH for {e.hostname}: the server's key changed. This can mean "
                     "a man-in-the-middle attack. Verify it, then fix your known_hosts.") from None
             except paramiko.SSHException as e:
-                if "not found in known_hosts" in str(e):
-                    raise ProviderError(
-                        f"{self.cfg.host} is not a known host. Run `shipr test -e <env> --trust` "
-                        "once to verify and store its key.") from None
                 last = e
             except (OSError, EOFError) as e:
                 last = e
@@ -121,26 +192,38 @@ class SFTPProvider(Provider):
     def _connect_once(self) -> None:
         self.close()
         client = paramiko.SSHClient()
-        client.load_system_host_keys()
         own = app_dir() / "known_hosts"
-        extra = Path(self.cfg.known_hosts).expanduser() if self.cfg.known_hosts else None
-        for f in (own, extra):
-            if f and f.is_file():
-                client.load_host_keys(str(f))
-        client.set_missing_host_key_policy(
-            _TrustOnFirstUse(own) if self.trust_new_host else paramiko.RejectPolicy())
-        client.connect(
-            self.cfg.host, port=self.cfg.port, username=self.cfg.username,
-            password=self.cfg.password,
-            key_filename=str(Path(self.cfg.key_file).expanduser()) if self.cfg.key_file else None,
-            passphrase=self.cfg.passphrase, timeout=self.cfg.timeout,
-            banner_timeout=self.cfg.timeout, auth_timeout=self.cfg.timeout,
-            allow_agent=not self.cfg.password, look_for_keys=False,
-        )
-        key = client.get_transport().get_remote_server_key()
-        self.host_fingerprint = f"{key.get_name()} SHA256:{key.fingerprint}"
+        if not self.cfg.host_key:  # a pin is the only trust anchor: a stale entry can't veto it
+            client.load_system_host_keys()
+            extra = Path(self.cfg.known_hosts).expanduser() if self.cfg.known_hosts else None
+            for f in (own, extra):
+                if f and f.is_file():
+                    client.load_host_keys(str(f))
+        client.set_missing_host_key_policy(_HostKeyPolicy(
+            own, self.cfg.host_key or [], self.trust_new_host, self.confirm_host_key))
+        secret = lambda s: s.get_secret_value() if s else None  # noqa: E731
+        try:
+            client.connect(
+                self.cfg.host, port=self.cfg.port, username=self.cfg.username,
+                password=secret(self.cfg.password),
+                key_filename=str(Path(self.cfg.key_file).expanduser())
+                if self.cfg.key_file else None,
+                passphrase=secret(self.cfg.passphrase), timeout=self.cfg.timeout,
+                banner_timeout=self.cfg.timeout, auth_timeout=self.cfg.timeout,
+                allow_agent=not secret(self.cfg.password), look_for_keys=False,
+            )
+            key = client.get_transport().get_remote_server_key()
+            self._check_pin(key)  # a pin wins even when known_hosts accepted the key
+        except BaseException:
+            client.close()
+            raise
+        self.host_fingerprint = describe_key(key)
         self.client, self._sftp = client, client.open_sftp()
         self._sftp.get_channel().settimeout(max(self.cfg.timeout, 30))
+
+    def _check_pin(self, key: paramiko.PKey) -> None:
+        if self.cfg.host_key and key.fingerprint not in self.cfg.host_key:
+            raise _pin_mismatch(self.cfg.host, key, self.cfg.host_key)
 
     def close(self) -> None:
         if self.client:
@@ -392,16 +475,23 @@ class SFTPProvider(Provider):
         return stdout.channel.recv_exit_status(), out, err
 
     def sha256(self, paths: list[str]) -> dict[str, str]:
+        """Hash with `sha256sum` over SSH where possible, else by downloading. The output is
+        trusted only when it is exactly one `<64 hex>  <path>` line per requested path, in
+        order, with exit status 0: a crafted file name (BusyBox doesn't escape newlines), an
+        unreadable file or a missing binary all make the batch fall back to downloading."""
         if not paths or not self.can_exec():
             return super().sha256(paths)
         out: dict[str, str] = {}
-        for i in range(0, len(paths), SHA256_BATCH):
-            batch = paths[i:i + SHA256_BATCH]
-            _, stdout, _ = self.exec("sha256sum -- " + " ".join(map(shlex.quote, batch)))
-            for line in stdout.splitlines():
-                digest, _, name = line.partition("  ")
-                out[name] = digest
-        # names sha256sum escaped, or no sha256sum binary at all: hash by downloading
+        plain = [p for p in paths if "\n" not in p and "\\" not in p]  # never escaped
+        for i in range(0, len(plain), SHA256_BATCH):
+            batch = plain[i:i + SHA256_BATCH]
+            code, stdout, _ = self.exec("sha256sum -- " + " ".join(map(shlex.quote, batch)))
+            lines = stdout.splitlines()
+            if code != 0 or len(lines) != len(batch):
+                continue
+            digests = [_sha256_line(line, path) for line, path in zip(lines, batch, strict=True)]
+            if all(digests):
+                out.update(zip(batch, digests, strict=True))
         missing = [p for p in paths if p not in out]
         if missing:
             out.update(super().sha256(missing))

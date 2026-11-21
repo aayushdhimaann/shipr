@@ -27,12 +27,15 @@ def configure(project, server, auth: str, extra_env: str = "", top: str = "", **
 
 
 def deploy(project, ui=None, **opts):
-    opts.setdefault("trust_new_host", True)
+    with provider(project, trust=True):  # confirm the test server's key once (like a user)
+        pass
     return helpers.deploy(project.repo, ui, **opts)
 
 
 def provider(project, trust=True) -> SFTPProvider:
-    return engine.open_provider(load_env(project.repo)[1], trust_new_host=trust)
+    """trust=True: --trust plus a "yes" at the fingerprint prompt."""
+    return engine.open_provider(load_env(project.repo)[1], trust_new_host=trust,
+                                confirm_host_key=(lambda host, key: True) if trust else None)
 
 
 def test_password_auth_full_incremental_delete_and_hooks(project, ssh_server, monkeypatch):
@@ -160,9 +163,10 @@ def test_sftp_only_server_uploads_and_skips_hooks(project, sftp_only_server):
 
 def test_cli_test_command(project, ssh_server):
     configure(project, ssh_server, f"      password: {PASSWORD}\n")
-    ui = RecordingUI()
+    ui = RecordingUI(trust_hosts=True)
     assert admin.check_connection(load_env(project.repo)[1], trust=True, ui=ui)
     assert "shell commands: available" in ui.text and "write access" in ui.text
+    assert "host key: ssh-" in ui.text and "SHA256:SHA256:" not in ui.text
 
 
 # --- filesystem safety on a real OpenSSH server (C-1, C-2, C-7) ---------------------------------
@@ -266,3 +270,76 @@ def test_default_state_beside_web_root_and_clean_error_when_not_creatable(projec
     finally:
         with provider(project) as p:
             p.exec(f"chmod 755 {locked}")
+
+
+# --- host keys (Phase 2C: C-10) -----------------------------------------------------------------
+def server_fingerprint(project) -> str:
+    with provider(project, trust=True) as p:
+        fp = p.host_fingerprint.split()[1]
+    (config.app_dir() / "known_hosts").unlink()  # forget it again: like a fresh CI runner
+    return fp
+
+
+def test_pinned_host_key_works_without_known_hosts(project, ssh_server):
+    configure(project, ssh_server, f"      password: {PASSWORD}\n")
+    fp = server_fingerprint(project)
+    configure(project, ssh_server, f"      password: {PASSWORD}\n", host_key=fp)
+    project.write("a.txt", "a")
+    project.commit()
+    rec = helpers.deploy(project.repo)  # no --trust, no known_hosts entry: the pin decides
+    assert rec.status == "success"
+    assert not (config.app_dir() / "known_hosts").exists()
+
+
+def test_wrong_pin_is_refused_even_when_known_hosts_trusts_the_key(project, ssh_server):
+    configure(project, ssh_server, f"      password: {PASSWORD}\n")
+    with provider(project, trust=True):
+        pass  # now in shipr's known_hosts
+    configure(project, ssh_server, f"      password: {PASSWORD}\n",
+              host_key="SHA256:" + "A" * 43)
+    with pytest.raises(ProviderError, match="HOST KEY MISMATCH"):
+        provider(project, trust=False).connect()
+
+
+def test_noninteractive_trust_never_accepts_an_unknown_key(project, ssh_server, monkeypatch):
+    from click.testing import CliRunner
+
+    from shipr.cli import cli
+
+    configure(project, ssh_server, f"      password: {PASSWORD}\n")
+    project.write("a.txt", "a")
+    project.commit()
+    monkeypatch.chdir(project.repo)
+    r = CliRunner().invoke(cli, ["deploy", "--trust", "--yes"])  # stdin is not a terminal
+    assert r.exit_code == 1 and "host_key: SHA256:" in r.output, r.output
+    assert not (config.app_dir() / "known_hosts").exists()
+
+
+def test_real_sha256sum_output_is_accepted_without_downloading(project, ssh_server, tmp_path):
+    """C-16: the strict parser must still accept genuine GNU sha256sum output."""
+    import hashlib
+
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n")
+    names = ["plain.txt", "with space.txt", "ünïcode.txt", "a'quote.txt"]
+    with provider(project) as p:
+        for n in names:
+            f = tmp_path / "src"
+            f.write_text(n)
+            p.upload(f, f"{remote}/{n}")
+        p.download = lambda *a: pytest.fail("fell back to downloading")
+        got = p.sha256([f"{remote}/{n}" for n in names])
+    assert got == {f"{remote}/{n}": hashlib.sha256(n.encode()).hexdigest() for n in names}
+
+
+def test_pin_wins_over_a_stale_known_hosts_entry(project, ssh_server):
+    configure(project, ssh_server, f"      password: {PASSWORD}\n")
+    fp = server_fingerprint(project)
+    import paramiko
+
+    stale = paramiko.ECDSAKey.generate()
+    host = f"[127.0.0.1]:{ssh_server['port']}"
+    known = config.app_dir() / "known_hosts"
+    known.write_text(f"{host} {stale.get_name()} {stale.get_base64()}\n")  # old server key
+    configure(project, ssh_server, f"      password: {PASSWORD}\n", host_key=fp)
+    with provider(project, trust=False) as p:
+        assert p.host_fingerprint.endswith(fp)

@@ -4,9 +4,12 @@
 
 | Risk | Mitigation |
 |---|---|
-| Man-in-the-middle on first or later connections | Host keys are always checked against `~/.ssh/known_hosts` and shipr's own known_hosts. An unknown host is refused until you run `shipr test --trust`, which shows the fingerprint and saves it. A changed key is a hard error. |
+| Man-in-the-middle on first or later connections | Host keys are always checked against `~/.ssh/known_hosts`, shipr's own known_hosts and an optional extra file. A pinned `host_key` fingerprint wins over all of them and needs no known_hosts entry. An unknown host is refused, and the error shows its fingerprint. `--trust` only lets shipr *ask*: it shows the fingerprint and saves the key after you confirm in a terminal. Without a terminal, and with `--yes`, it never trusts a key. A changed key, or one that doesn't match the pin, is a hard error. |
+| Accepting a MITM key in CI | CI runners start with an empty known_hosts, so trusting on first use there would accept any key. shipr refuses instead and tells you to pin `host_key`. |
+| Tampered `sha256sum` output | When the server hashes files for shipr, its output is used only if it has exactly one line per requested file, in order, for exactly that path, with exit status 0. A crafted file name (BusyBox doesn't escape newlines), an unreadable file or a missing binary makes shipr download and hash the files itself. |
 | Uploading secrets | Built-in excludes for `.env*`, keys and `.git`. Only *committed* files are deployed, so a stray local file can't slip in. |
-| Secrets in config or logs | Credentials come only from environment variables or `.env`. Validation errors never echo values. Commands are not interpolated, so a secret never appears in output or deploy history. |
+| Secrets in config or logs | Credentials come only from environment variables or `.env`. Validation errors never echo values. Passwords and passphrases are kept as secret values that `repr()` and tracebacks don't show. Commands are not interpolated, so a secret never appears in output or deploy history. |
+| Build tools reading deploy credentials | By default local commands see your whole environment and `.env`, as documented, so a compromised npm or composer package could read deploy passwords. `build.env` narrows this to the variables you name plus a few basics. |
 | Writing or deleting outside the deploy folder | Every path is validated *before* anything changes, including paths read back from the server's manifest. `remote_path` and `state_path` must be normalised absolute paths, and `/` is refused. Repo files can never overwrite shipr's state directory. |
 | Symlinks on the server redirecting a write, read or delete | Below `remote_path` and `state_path`, shipr never goes through a symlink, special file or unreadable directory. The planner leaves anything at or under one untouched and reports it. Before every mkdir, upload, rename, delete and lock, each directory between the root and the target is checked again with `lstat`. A directory shipr creates is re-checked right after creating it. There is no cache of earlier checks. |
 | State mixed with site files or another environment's state | `state_path` may not be `remote_path` or a parent of it. On the same server, environments may not share or nest state dirs, or keep state inside another's `remote_path`. When shipr can't tell whether two hosts are the same machine, it warns. |
@@ -17,7 +20,7 @@
 | Overwriting hotfixes made on the server | A file whose size or modified time changed since shipr's last deploy is backed up before it is overwritten. |
 | Half-written files served to visitors | Each upload goes to a temporary file that is then renamed over the target. |
 | Two deploys at once | An exclusive lock file is created on the server for the length of the deploy. A deploy only ever removes its own lock. `kill` (SIGTERM) is handled like Ctrl-C: progress is saved and the lock released. |
-| Deploy records exposed on the website | By default records live beside the web root, not in it (`/var/www/html` → `/var/www/.shipr/html`). Records inside the web root (configured, or left there by shipr 0.1) trigger a warning on every deploy and in `shipr status` and `shipr test`. `.htaccess` is written but is not relied on: it only works on Apache with `AllowOverride`. |
+| Deploy records exposed on the website | By default records go beside `remote_path`, in its parent folder (`/var/www/html` → `/var/www/.shipr/html`). That is outside the site only when `remote_path` is the web root itself; see "What you must know". The first deploy to the default location and `shipr test` warn about this. Records inside `remote_path` (configured, or left there by shipr 0.1) warn on every deploy and in `shipr status` and `shipr test`. `.htaccess` is written but not relied on: it only works on Apache with `AllowOverride`. |
 | A deploy reported as successful when its records weren't saved | The manifest and the history record are saved separately and checked. If either fails, the deploy exits non-zero, and a manifest that wasn't saved marks the record `failed`. Each record notes whether its files finished, how its hooks went, and whether the manifest was saved. |
 
 ## What you must know
@@ -27,7 +30,11 @@
   the same way you review code. Don't run shipr on repositories you don't trust.
 - **The deploy user's permissions are the real boundary.** Use a dedicated SSH user that can write
   only to the web root, not root.
-- **Prefer key authentication** with a passphrase, or an ssh-agent, over passwords.
+- **Prefer key authentication** with a passphrase, or an ssh-agent, over passwords. In CI, keep
+  deploy credentials out of build steps' reach with `build.env`, and pin `host_key`.
+- **known_hosts writes.** shipr appends each line in one write, so concurrent shipr processes
+  don't interleave lines on POSIX. Windows doesn't guarantee this for appends, but a pinned
+  `host_key` needs no known_hosts writes at all.
 - **Detecting server-side edits uses size and modified time, not file contents** (hashing every
   remote file would mean downloading it). An edit that keeps the same size *and* restores the old
   modified time would go unnoticed.
@@ -39,6 +46,13 @@
   server's user write where shipr deploys, other than in directories you `protect`. Components
   *above* `remote_path` and `state_path` (for example `/var/www -> /srv/www`) are your own
   configuration and are followed.
+- **The default state location is not guaranteed to be private.** shipr can't know your web
+  server's document root. If `remote_path` is a folder inside a site (`public_html/staging`), the
+  default beside it is inside that site too. Set `state_path` to a folder outside the web root
+  whenever the default could be served.
+- **Hooks may run more than once.** After a failed, interrupted or partial deploy, the next deploy
+  re-runs that phase's hooks, including ones that had already succeeded. Make hooks safe to
+  repeat.
 - **Backups and the manifest may contain your code.** Keep `state_path` private (see above) and
   prune old backups.
 

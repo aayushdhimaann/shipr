@@ -164,7 +164,7 @@ flowchart TD
   x -- "absolute or escaping symlink" --> e2["GitError"]
   x --> pd["project_dir = export / folder of shipr.yml / source<br/>must exist inside the export"]
   pd -- missing --> e3["DeployError"]
-  pd --> he["hook environment = your environment<br/>+ .env values + SHIPR_ENV, SHIPR_COMMIT, SHIPR_PROJECT"]
+  pd --> he["hook environment = your environment + .env values<br/>(or only build.env names + basics)<br/>+ SHIPR_ENV, SHIPR_COMMIT, SHIPR_PROJECT"]
   he --> lb["run hooks.local_before in project_dir"]
   lb --> bc["run build.commands one by one"]
   lb -- "non-zero exit" --> e4["DeployError: command failed"]
@@ -191,18 +191,21 @@ Code: `engine.open_provider · SFTPProvider.connect / _connect_once / _retry`
 ```mermaid
 flowchart TD
   s(["open_provider(env)"]) --> reg["look up provider by name<br/>entry points shipr.providers + built-ins"]
-  reg --> v["validate sftp settings<br/>host, port, username, password or key_file,<br/>passphrase, timeout, retries, known_hosts"]
+  reg --> v["validate sftp settings<br/>host, port, username, password or key_file,<br/>passphrase, timeout, retries, known_hosts, host_key"]
   v --> ea["exec_allowed = ssh_exec is not false"]
   ea --> c["connection attempt"]
-  c --> kh["load host keys<br/>~/.ssh/known_hosts + shipr known_hosts<br/>+ sftp.known_hosts file"]
-  kh --> pol{"--trust?"}
-  pol -- no --> rej["unknown host is rejected"]
-  pol -- yes --> tofu["unknown host is accepted once<br/>and saved to shipr known_hosts"]
-  rej --> ssh["SSH handshake + login<br/>password · key + passphrase · ssh-agent"]
+  c --> kh["load host keys<br/>~/.ssh/known_hosts + shipr known_hosts<br/>+ sftp.known_hosts file<br/>(none when host_key is pinned: the pin alone decides)"]
+  kh --> pol{"unknown host: host_key pinned?"}
+  pol -- "yes: matches" --> pin["accepted in memory<br/>(nothing written)"]
+  pol -- "yes: differs" --> e4["ProviderError: HOST KEY MISMATCH"]
+  pol -- no --> tr{"--trust and the user confirms<br/>the fingerprint in a terminal?"}
+  tr -- no --> rej["rejected; the error shows the fingerprint<br/>and how to pin it"]
+  tr -- yes --> tofu["saved to shipr known_hosts<br/>(one O_APPEND write)"]
+  pin --> ssh["SSH handshake + login<br/>password · key + passphrase · ssh-agent<br/>then: a pinned key must match, even if known_hosts accepted it"]
   tofu --> ssh
   ssh -- "login refused" --> e1["ProviderError: authentication failed<br/>(no retry)"]
   ssh -- "server key changed" --> e2["ProviderError: HOST KEY MISMATCH<br/>(no retry)"]
-  ssh -- "host not known" --> e3["ProviderError: run shipr test --trust"]
+  rej --> e3["ProviderError (no retry)"]
   ssh -- "network error or timeout" --> left{"attempts left?"}
   left -- yes --> wait["wait 1s, 2s, 4s … up to 10s"]
   wait --> c
@@ -534,7 +537,7 @@ flowchart TB
 
 Code: `state.RemoteState · models.Manifest · models.DeployRecord`
 
-Everything lives under `state_path`, by default beside the web root: `<parent of remote_path>/.shipr/<name of remote_path>`, so `/var/www/html` → `/var/www/.shipr/html`. If that default is empty but `<remote_path>/.shipr/manifest.json` exists (shipr 0.1's default), the old location is used and a warning explains how to move it. Because it is on the server, every teammate and every CI run sees the same state. `manifest.json` also records the `project` and `remote_path` it belongs to. A deploy, `status` or `rollback` whose `remote_path` doesn't match refuses to use it.
+Everything lives under `state_path`, by default beside `remote_path`: `<parent of remote_path>/.shipr/<name of remote_path>`, so `/var/www/html` → `/var/www/.shipr/html`. That is outside the site only when `remote_path` is the web root. If the default has no `manifest.json` but `<remote_path>/.shipr/manifest.json` exists (shipr 0.1's default), the old location is used and a warning explains how to move it. If both exist, shipr stops and asks. Because it is on the server, every teammate and every CI run sees the same state. `manifest.json` also records the `project` and `remote_path` it belongs to. A deploy, `status` or `rollback` whose `remote_path` doesn't match refuses to use it.
 
 ```text
 .shipr/

@@ -79,9 +79,7 @@ def _build(cfg: Config, env: Environment, ref: str | None, ui: UI, tmp: Path) ->
     rel_project = os.path.relpath(cfg.dir.resolve(), repo.resolve())
     project_dir = _inside(export_root, export_root / rel_project / env.source,
                           f"source directory {env.source!r} not found in {sha[:7]}")
-    # local commands see .env values as environment variables (commands aren't interpolated)
-    hook_env = {**cfg.variables(), "SHIPR_ENV": env.name, "SHIPR_COMMIT": sha,
-                "SHIPR_PROJECT": cfg.project_name}
+    hook_env = command_env(cfg, env, sha)
     run_local(env.hooks.local_before, project_dir, hook_env, ui)
     run_local(env.build.commands, project_dir, hook_env, ui)
     out_dir = _inside(export_root, project_dir / env.build.output,
@@ -94,6 +92,27 @@ def _build(cfg: Config, env: Environment, ref: str | None, ui: UI, tmp: Path) ->
                      project_dir=project_dir,
                      prefix=out_dir.relative_to(export_root).as_posix(),
                      rules=rules, files=files, hook_env=hook_env)
+
+
+# always passed to local commands so tools keep working under a `build.env` allowlist
+BASIC_ENV = {"PATH", "HOME", "USER", "LOGNAME", "USERNAME", "SHELL", "LANG", "LANGUAGE", "TERM",
+             "TZ", "TMPDIR", "TEMP", "TMP", "CI", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR",
+             "COMSPEC", "PATHEXT", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA",
+             "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "NUMBER_OF_PROCESSORS",
+             "PROCESSOR_ARCHITECTURE"}
+
+
+def command_env(cfg: Config, env: Environment, sha: str) -> dict[str, str]:
+    """The complete environment of local commands. Commands aren't interpolated, so they read
+    .env values from here. By default that is everything (your environment plus .env), which
+    includes deploy credentials; `build.env` narrows it to the named variables plus basics."""
+    variables = cfg.variables()
+    if env.build.env is not None:
+        allowed = {n.upper() for n in env.build.env} | BASIC_ENV
+        variables = {k: v for k, v in variables.items()
+                     if k.upper() in allowed or k.upper().startswith("LC_")}
+    return {**variables, "SHIPR_ENV": env.name, "SHIPR_COMMIT": sha,
+            "SHIPR_PROJECT": cfg.project_name}
 
 
 def _inside(root: Path, path: Path, missing_msg: str) -> Path:

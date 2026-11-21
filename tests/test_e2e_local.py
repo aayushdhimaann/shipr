@@ -496,7 +496,7 @@ def test_default_records_live_beside_the_web_root(project):
     ui = RecordingUI()
     run(project, ui=ui)
     assert (project.state / "manifest.json").exists()
-    assert not (project.site / ".shipr").exists() and "web root" not in ui.text
+    assert not (project.site / ".shipr").exists() and "inside the web root" not in ui.text
 
 
 def test_legacy_in_root_records_keep_working_with_a_warning(project):
@@ -736,3 +736,115 @@ def test_rollback_after_interrupted_deploy_restores_last_completed(project, monk
     rec = engine.rollback(cfg, env, options=engine.DeployOptions(yes=True), ui=ui)
     assert rec.commit == b and "interrupted" in ui.text
     assert (project.site / "v.txt").read_text() == "B" and not (project.site / "n0.txt").exists()
+
+
+# --- legacy (shipr 0.1, in-root) records: migration safety ------------------------------------
+def deploy_with_legacy_records(project, n=2):
+    """n deploys that keep records at <remote>/.shipr, then the config goes back to default."""
+    add_env_option(project, "state_path: /site/.shipr")
+    for i in range(n):
+        project.write("a.txt", "a" * (i + 1))
+        project.commit()
+        run(project)
+    project.write_config()
+    return project.site / ".shipr"
+
+
+def test_legacy_records_keep_their_history(project):
+    legacy = deploy_with_legacy_records(project)
+    project.write("a.txt", "new")
+    project.commit()
+    run(project)
+    assert len(list((legacy / "history").iterdir())) == 3 and not project.state.exists()
+
+
+def test_records_in_both_locations_are_ambiguous(project):
+    import shutil
+
+    legacy = deploy_with_legacy_records(project)
+    shutil.copytree(legacy, project.state)  # a migration that copied but hasn't removed yet
+    project.write("a.txt", "new")
+    project.commit()
+    with pytest.raises(StateError, match="both") as e:
+        run(project)
+    assert str(legacy) in str(e.value).replace("\\", "/") or "/site/.shipr" in str(e.value)
+    assert (legacy / "manifest.json").exists() and (project.state / "manifest.json").exists()
+    assert (project.site / "a.txt").read_text() == "aa"  # nothing deployed
+    shutil.rmtree(legacy)  # finishing the migration resolves it
+    assert run(project).status == "success"
+    assert len(list((project.state / "history").iterdir())) == 3  # history came along
+
+
+def test_interrupted_migration_keeps_using_the_original(project):
+    legacy = deploy_with_legacy_records(project)
+    (project.state / "history").mkdir(parents=True)  # copy began: history only, no manifest yet
+    project.write("a.txt", "new")
+    project.commit()
+    ui = RecordingUI()
+    run(project, ui=ui)
+    assert "inside the web root" in ui.text
+    assert len(list((legacy / "history").iterdir())) == 3  # original records still in use
+
+
+def test_legacy_records_of_another_target_are_refused(project):
+    legacy = deploy_with_legacy_records(project)
+    m = json.loads((legacy / "manifest.json").read_text())
+    m["remote_path"] = "/other-site"
+    (legacy / "manifest.json").write_text(json.dumps(m))
+    project.write("a.txt", "new")
+    project.commit()
+    with pytest.raises(StateError, match="belong to remote_path /other-site"):
+        run(project)
+
+
+def test_first_deploy_to_default_location_warns_it_may_be_served(project):
+    project.write("a.txt", "a")
+    project.commit()
+    ui = RecordingUI()
+    run(project, ui=ui)
+    assert "public_html/staging" in ui.text and "state_path" in ui.text
+    project.write("a.txt", "b")
+    project.commit()
+    ui = RecordingUI()
+    run(project, ui=ui)
+    assert "public_html/staging" not in ui.text  # once, when the records are created
+
+
+def test_explicit_state_path_outside_never_warns(project):
+    add_env_option(project, "state_path: /records/site")
+    project.write("a.txt", "a")
+    project.commit()
+    ui = RecordingUI()
+    run(project, ui=ui)
+    assert "warning" not in ui.text
+
+
+# --- environment exposure of local commands (C-14) -----------------------------------------------
+def env_dump_build(project, extra=""):
+    script = project.repo / "dump.py"
+    script.write_text("import json, os\nos.makedirs('out', exist_ok=True)\n"
+                      "json.dump(sorted(os.environ), open('out/env.json', 'w'))\n")
+    project.write_config(
+        f"build:\n  commands: ['\"{Path(sys.executable).as_posix()}\" dump.py']\n"
+        f"  output: out\n{extra}")
+    (project.repo / ".env").write_text("APP_KEY=k\nSHIPR_PROD_PASSWORD=secret\n")
+    project.commit()
+
+
+def test_build_env_allowlist_hides_everything_else(project, monkeypatch):
+    monkeypatch.setenv("SHIPR_KEY_PASSPHRASE", "pp")
+    monkeypatch.setenv("NODE_ENV", "production")
+    env_dump_build(project, "  env: [NODE_ENV, APP_KEY]\n")
+    run(project)
+    seen = set(json.loads((project.site / "env.json").read_text()))
+    assert {"NODE_ENV", "APP_KEY", "SHIPR_ENV", "SHIPR_COMMIT"} <= seen
+    assert "PATH" in seen or "Path" in seen  # basics so tools still work
+    assert not {"SHIPR_PROD_PASSWORD", "SHIPR_KEY_PASSPHRASE"} & seen
+
+
+def test_without_allowlist_commands_still_see_everything(project, monkeypatch):
+    monkeypatch.setenv("SHIPR_KEY_PASSPHRASE", "pp")
+    env_dump_build(project)
+    run(project)
+    seen = set(json.loads((project.site / "env.json").read_text()))
+    assert {"SHIPR_PROD_PASSWORD", "SHIPR_KEY_PASSPHRASE", "APP_KEY"} <= seen  # documented

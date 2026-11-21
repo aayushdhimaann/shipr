@@ -160,6 +160,8 @@ source: .                        # project folder inside the repo; build command
 build:
   commands: []                   # shell commands, run in order inside the exported commit
   output: .                      # folder (relative to source) whose contents are uploaded
+  env: null                      # list of variable names local commands may see (plus PATH,
+                                 # HOME and other basics); null = all of them (see "Secrets")
 
 files:
   include: ["**"]                # gitignore-style patterns, relative to the output folder
@@ -172,6 +174,7 @@ hooks:
   local_after: []                # run locally after a successful deploy that changed something
   remote_before: []              # run on the server, in remote_path, before uploading
   remote_after: []               # run on the server, in remote_path, after a fully successful upload
+                                 # hooks can run more than once: make them safe to repeat (below)
 
 defaults: {}                     # any environment key below, applied to every environment
 
@@ -195,6 +198,8 @@ environments:
       timeout: 15                       # seconds, for connecting and for each operation
       retries: 3                        # reconnect attempts on network errors (with backoff)
       known_hosts: null                 # extra known_hosts file to trust
+      host_key: null                    # pinned server key, e.g. "SHA256:abc..." (or a list
+                                        # while rotating keys); wins over known_hosts
 ```
 
 - If there is no `password`, shipr also tries your ssh-agent. You can leave out both `password`
@@ -227,7 +232,11 @@ secret never shows up in output or in deploy history. Inside a command, use shel
 (`$TOKEN`):
 
 - **Local commands** (build, `local_*`) get your environment, the values from `.env`, and
-  `SHIPR_ENV`, `SHIPR_COMMIT` and `SHIPR_PROJECT`.
+  `SHIPR_ENV`, `SHIPR_COMMIT` and `SHIPR_PROJECT`. That includes your deploy credentials, so
+  every package an `npm ci` or `composer install` runs could read them. To limit this, list
+  the variables commands need in `build.env`, for example `env: [NODE_ENV, VITE_API_URL]`.
+  Commands then get only those, a few basics (`PATH`, `HOME`, locale, temp dirs and the Windows
+  system variables) and the `SHIPR_*` variables above.
 - **Remote commands** (`remote_*`) run with the server's own environment.
 
 ### Recipes by project type
@@ -254,19 +263,39 @@ Everything lives in `state_path` on the server, so every teammate sees the same 
 .shipr/backups/<id>/...         server copies saved before overwriting or deleting
 ```
 
-By default these live **beside the web root**, outside it: `remote_path: /var/www/html` keeps
-its records in `/var/www/.shipr/html`, and `/home/u123/public_html` keeps them in
-`/home/u123/.shipr/public_html`. If the deploy user can't create that directory, the deploy
-stops before changing anything and tells you to set `state_path`. Use a writable directory
-outside the web root, for example `/home/deploy/.shipr/my-app`. Backups are never deleted
-automatically.
+By default these live **beside `remote_path`**, in its parent folder: `remote_path:
+/var/www/html` keeps its records in `/var/www/.shipr/html`, and `/home/u123/public_html` keeps
+them in `/home/u123/.shipr/public_html`. If the deploy user can't create that directory, the
+deploy stops before changing anything and tells you to set `state_path`. Backups are never
+deleted automatically.
+
+**The default is not private by itself.** It is outside your site only when `remote_path` *is*
+the web root. If you deploy into a folder inside a site, for example `remote_path:
+/home/u123/public_html/staging`, the default (`/home/u123/public_html/.shipr/staging`) is inside
+that site too, and anyone could fetch it over HTTP unless the web server denies it. shipr can't
+know your web server's document root, so it doesn't guess. It warns the first time it creates
+records at the default location and in `shipr test`, and `shipr status` labels the location.
+Whenever the default could be served, set an explicit `state_path` outside the web root, for
+example `/home/deploy/.shipr/my-app-staging`.
 
 **Records inside the web root** (`state_path` under `remote_path`, or records left at
 `<remote_path>/.shipr` by shipr 0.1) still work, but shipr warns on every deploy. Anyone who can
 reach that path over HTTP can read the manifest, history and backups, and backed-up scripts may
 still run. A `.htaccess` deny is written, but it only works on Apache with `AllowOverride`. On
-nginx, add `location ^~ /.shipr/ { deny all; }`. To move 0.1 records out, move
-`<remote_path>/.shipr` to the new default location; shipr finds them there on the next deploy.
+nginx, add `location ^~ /.shipr/ { deny all; }`.
+
+**Moving records left inside the web root by shipr 0.1.** With no `state_path` set, shipr keeps
+using `<remote_path>/.shipr` until records appear at the new default. shipr never moves, copies or
+deletes them itself, so their history stays intact. To move them:
+
+1. Make sure no deploy is running.
+2. Copy `<remote_path>/.shipr` to the new default location, or to a `state_path` you set.
+3. Check the copy, then delete `<remote_path>/.shipr`.
+
+If you stop between steps 2 and 3, the records exist in both places. shipr then refuses to deploy
+and names both locations, instead of guessing which is current. A copy that has no
+`manifest.json` yet is ignored, and the original stays in use. Records that belong to a different
+`remote_path` are always refused.
 
 `state_path` must be a directory of its own. It may not be `remote_path` or one of its parents.
 Two environments on the same server may not share state, nest their state dirs, or keep state
@@ -299,7 +328,7 @@ Connects to the server and reports:
 
 | Option | |
 |---|---|
-| `--trust` | Accept an unknown host key and remember it in shipr's `known_hosts` (next to the global config). Verify the printed fingerprint! |
+| `--trust` | For an unknown host key: show its fingerprint, ask you to confirm it (terminal only; never with `--yes`), then remember it in shipr's `known_hosts` (next to the global config) |
 
 ### `shipr deploy -e ENV`
 Exports the commit, builds, plans, asks, uploads and records.
@@ -332,6 +361,15 @@ and failed (!), and who ran it.
 |---|---|
 | `-n N` | How many recent deploys to list (default 20) |
 | `--show ID` | Print one deploy record in full (JSON, including every file) |
+
+### Hooks run again after a failure
+
+When a remote hook fails, or a deploy is interrupted or ends `partial`, its hooks haven't all
+finished. The next deploy runs them again, even if no file changed. It runs *every* hook of that
+phase again, including any that had already succeeded, because shipr doesn't track hooks one by
+one. Write hooks so that running them twice is safe: `npm ci`, `composer install`, cache clears,
+`php artisan migrate` (it skips applied migrations) and `pm2 reload` are fine. A hook that sends
+an email or appends to a file on every run is not.
 
 ### `shipr rollback -e ENV`
 Redeploys an earlier commit through the normal pipeline, so only the files that differ change
@@ -396,9 +434,26 @@ loss) do you need `shipr unlock` first.
     SHIPR_PROD_PASSWORD: ${{ secrets.SHIPR_PROD_PASSWORD }}
 ```
 
-To check the host key in CI, commit the server's verified `known_hosts` line to a file and point
-`sftp.known_hosts` at it. The path is resolved from the directory shipr runs in. Avoid `--trust`
-in CI, because it accepts whatever key the server presents.
+**Check the host key in CI by pinning it.** A CI runner starts with no `known_hosts`, so pin the
+server's verified fingerprint in `shipr.yml`:
+
+```yaml
+    sftp:
+      host: example.com
+      host_key: "SHA256:REPLACE-with-your-servers-verified-fingerprint"   # 43 chars after SHA256:
+```
+
+Get it from your hosting provider, or run `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on
+the server, or read the `host key:` line that `shipr test` prints once you have verified it.
+`--trust` doesn't help in CI: without a terminal it refuses, and it never accepts a key on its
+own, not even with `--yes`. Pointing `sftp.known_hosts` at a committed, verified
+`known_hosts` file also works.
+
+**Rotating the server's key.** Before the switch, pin both fingerprints
+(`host_key: ["SHA256:old...", "SHA256:new..."]`). After it, remove the old one. If you rely on
+`known_hosts` instead, remove the host's old line from shipr's `known_hosts` (next to the global
+config) or from `~/.ssh/known_hosts`. Then run `shipr test --trust` and compare the new
+fingerprint before confirming.
 
 ## How it works
 
@@ -433,8 +488,9 @@ older commit.
 
 ## Safety
 
-- **Server identity.** Host keys are always checked, and an unknown host is refused until you
-  accept it with `--trust`.
+- **Server identity.** Host keys are always checked. Pin the key with `host_key` (best for CI),
+  or accept an unknown host with `--trust`, which shows the fingerprint and asks you to confirm
+  in a terminal.
 - **Secrets.** They come only from environment variables or `.env`, are never echoed, and are
   never uploaded.
 - **Path checks.** Every path is validated before anything changes. Nothing outside `remote_path`
@@ -457,8 +513,9 @@ Details are in [docs/security.md](docs/security.md).
 
 | Message | What to do |
 |---|---|
-| `... is not a known host` | Run `shipr test -e ENV --trust` once and compare the fingerprint with your host's. |
-| `HOST KEY MISMATCH` | The server key changed. Confirm with your host why, then remove the old line from `known_hosts`. |
+| `... is not a known host` | The error shows the server's fingerprint. Verify it with your host, then pin it as `host_key`, or run `shipr test -e ENV --trust` in a terminal and confirm. |
+| `... was not confirmed, so it is not trusted` | `--trust` needs a terminal to ask you. In CI, pin `host_key` instead. |
+| `HOST KEY MISMATCH` | The server key changed, or doesn't match your `host_key` pin. Confirm with your host why. Then update the pin, or remove the old line from `known_hosts` (see "Rotating the server's key"). |
 | `authentication failed` | Check `username`, and the password or key. Check the `${VARIABLE}` is set (`shipr validate`). |
 | `could not connect` | Check the host and port and your firewall. Raise `timeout` or `retries` for slow links. |
 | `remote_path ... must be a normalised absolute directory` | Use a full path like `/home/u123/public_html`. `shipr test` prints your login directory. |

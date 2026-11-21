@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import posixpath
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from . import gitops, providers
@@ -34,22 +35,43 @@ class DeployOptions:
     kind: Kind = "deploy"
 
 
-def open_provider(env: Environment, trust_new_host: bool = False) -> Provider:
+def open_provider(env: Environment, trust_new_host: bool = False,
+                  confirm_host_key: Callable[[str, str], bool] | None = None) -> Provider:
+    """`trust_new_host` (--trust) only allows *asking* `confirm_host_key` about an unknown
+    server key; without a confirmation the key is never trusted."""
     provider = providers.get(env.provider)(env.provider_settings, trust_new_host=trust_new_host)
+    provider.confirm_host_key = confirm_host_key
     provider.exec_allowed = env.ssh_exec is not False
     provider.roots = (env.remote_path, env.effective_state_path)
     return provider
 
 
 def state_for(env: Environment, provider: Provider) -> RemoteState:
-    """The environment's records: `state_path`, else the default beside the web root. Records
+    """The environment's records: `state_path`, else the default beside remote_path. Records
     already at shipr 0.1's default (inside the web root) keep being used until moved."""
     root, legacy = env.effective_state_path, False
     if env.state_path is None \
-            and provider.stat(posixpath.join(root, "manifest.json")) is None \
             and provider.stat(posixpath.join(env.legacy_state_path, "manifest.json")):
+        if provider.stat(posixpath.join(root, "manifest.json")):
+            # e.g. a migration that copied the records but hasn't removed the old ones yet
+            raise StateError(
+                f"deploy records exist in both {root} and {env.legacy_state_path} (shipr "
+                "0.1's location, inside the web root); shipr won't guess which is current. "
+                f"If you moved them to {root}, delete {env.legacy_state_path}. Otherwise set "
+                "`state_path` to the one to keep using.")
         root, legacy = env.legacy_state_path, True
     return RemoteState(provider, root, env.remote_path, legacy)
+
+
+def default_location_warning(env: Environment, state: RemoteState) -> str | None:
+    """The default sits beside remote_path, which is outside the site only when remote_path
+    is the web root itself. shipr can't know the web server's document root, so it says so."""
+    if env.state_path is not None or state.legacy:
+        return None
+    return (f"deploy records go to {state.root}, the default location beside remote_path. "
+            "That is private only if your web server doesn't serve it: when remote_path is a "
+            "folder inside a site (e.g. public_html/staging), the default is inside that site "
+            "too. If it may be served, set `state_path` to a folder outside the web root.")
 
 
 def state_warnings(env: Environment, state: RemoteState) -> list[str]:
@@ -77,7 +99,7 @@ def deploy(cfg: Config, env: Environment, ref: str | None = None,
     options = options or DeployOptions()
     ui = ui or UI()
     with prepare(cfg, env, ref, ui) as ws:
-        with open_provider(env, options.trust_new_host) as provider:
+        with open_provider(env, options.trust_new_host, ui.trust_host) as provider:
             record = Deployment(cfg, env, provider, ws, options, ui).run()
         if record.status == "success" and record.changed:
             run_local(env.hooks.local_after, ws.project_dir, ws.hook_env, ui)
@@ -136,7 +158,7 @@ class Deployment:
             self.state.acquire_lock(self.record.id)
         except (OSError, ProviderError) as e:
             env = self.env
-            fix = (f"By default shipr keeps them beside the web root. Set `state_path` in "
+            fix = (f"By default shipr keeps them beside remote_path. Set `state_path` in "
                    "shipr.yml to a directory the deploy user can write outside the web root "
                    f"(e.g. /home/<user>/.shipr/{posixpath.basename(env.remote_path)}), or to "
                    f"{env.legacy_state_path} to keep them inside the web root (shipr warns on "
@@ -149,6 +171,9 @@ class Deployment:
         manifest = self.state.load_manifest()
         for w in self.state.check_owner(manifest, self.project):
             self.ui.warn(w)
+        first = default_location_warning(self.env, self.state)
+        if first and not manifest.deployed_commit and not manifest.files:
+            self.ui.warn(first)  # once: when the records are first created there
         self._warn_about(manifest)
         remote = scan_remote(self.env, self.provider, self.state)
         self._leftovers = self._own_leftovers(manifest, remote)
@@ -196,7 +221,7 @@ class Deployment:
         copies = self.state.backup_copies({base for _, base in parks})
         abs_park = {rel: safe_join(self.env.remote_path, rel) for rel, _ in parks}
         paths = list(abs_park.values()) + [p for ps in copies.values() for p in ps]
-        # hash by downloading, not via sha256sum output (C-16: its parsing is not trusted yet)
+        # hash by downloading: the most direct proof for a rare, safety-critical check
         digest = Provider.sha256(self.provider, paths)
         unproven = []
         for rel, base in parks:

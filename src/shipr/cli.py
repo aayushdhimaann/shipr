@@ -44,7 +44,16 @@ def make_ui() -> UI:
             click.echo("not a terminal: refusing to guess; pass --yes to confirm", err=True)
             return False
         return click.confirm(msg, default=False)
-    return UI(echo=click.echo, confirm=confirm)
+
+    def trust_host(host: str, key: str) -> bool:
+        if not sys.stdin.isatty():  # CI: the error that follows explains how to pin host_key
+            return False
+        return click.confirm(
+            f"The authenticity of host {host} can't be established. It presented:\n  {key}\n"
+            "Compare this with the server's real fingerprint (ask your provider, or run "
+            "`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the server).\n"
+            "Trust it and remember it?", default=False)
+    return UI(echo=click.echo, confirm=confirm, trust_host=trust_host)
 
 
 class Ctx:
@@ -185,7 +194,9 @@ def status(obj: Ctx, env_name) -> None:
             click.echo(f"{target} is at {sha[:7]} ({state})")
         except GitError:
             pass  # not in a repo / ref missing locally: the server-side status is still useful
-    click.echo(f"records: {s.state_root}")
+    default = "" if env.state_path else " (default location beside remote_path; set " \
+        "state_path if your web server could serve it)"
+    click.echo(f"records: {s.state_root}{default}")
     if m.in_progress:
         click.echo(f"warning: interrupted deploy {m.in_progress.deploy_id}")
     if m.hooks_pending:
