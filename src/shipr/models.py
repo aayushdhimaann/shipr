@@ -77,6 +77,10 @@ class DeployRecord(_Record):
     deleted: list[DeletedFile] = Field(default_factory=list)
     failed: list[FailedFile] = Field(default_factory=list)
     kept: list[str] = Field(default_factory=list)
+    # left untouched: at or under a server symlink, special file or unreadable directory
+    blocked: list[str] = Field(default_factory=list)
+    # shipr's own leftovers from interrupted uploads that were verified and removed
+    cleaned: list[str] = Field(default_factory=list)
 
     @property
     def changed(self) -> bool:

@@ -163,3 +163,78 @@ def test_cli_test_command(project, ssh_server):
     ui = RecordingUI()
     assert admin.check_connection(load_env(project.repo)[1], trust=True, ui=ui)
     assert "shell commands: available" in ui.text and "write access" in ui.text
+
+
+# --- filesystem safety on a real OpenSSH server (C-1, C-2, C-7) ---------------------------------
+def test_symlinked_dir_and_file_are_never_written_through(project, ssh_server):
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n",
+                       top="files:\n  protect: ['config.php']\n")
+    shared = f"{remote}-shared"
+    with provider(project) as p:
+        p.exec(f"mkdir -p {remote} {shared}/storage && printf DATA > {shared}/storage/data.txt "
+               f"&& printf REAL > {shared}/config.php && ln -s {shared}/storage {remote}/storage "
+               f"&& ln -s {shared}/config.php {remote}/config.php")
+    project.write("storage/data.txt", "from git")
+    project.write("config.php", "sample")
+    project.write("index.php", "i")
+    project.commit()
+    rec = deploy(project)
+    assert [u.path for u in rec.uploaded] == ["index.php"]
+    assert sorted(rec.blocked) == ["config.php", "storage/data.txt"]
+    with provider(project) as p:
+        _, out, _ = p.exec(f"cat {shared}/storage/data.txt {shared}/config.php; echo; "
+                           f"test -L {remote}/config.php && echo LINK")
+    assert out.split() == ["DATAREAL", "LINK"]
+
+
+def test_unreadable_dir_is_reported_not_fatal(project, ssh_server):
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n")
+    with provider(project) as p:
+        p.exec(f"mkdir -p {remote}/cache && chmod 000 {remote}/cache")
+    project.write("cache/x.txt", "x")
+    project.write("index.php", "i")
+    project.commit()
+    try:
+        rec = deploy(project)
+        assert rec.status == "success" and rec.blocked == ["cache/x.txt"]
+    finally:
+        with provider(project) as p:
+            p.exec(f"chmod 755 {remote}/cache")
+
+
+def test_symlink_swapped_in_after_planning(project, ssh_server):
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n",
+                       extra_env="    confirm: true\n")
+    project.write("assets/a.css", "v1")
+    project.commit()
+    deploy(project, yes=True)
+    project.write("assets/a.css", "v2")
+    project.commit()
+
+    class SwapUI(RecordingUI):
+        def _confirm(self, msg):
+            with provider(project) as p:
+                p.exec(f"mv {remote}/assets {remote}-moved && ln -s {remote}-moved "
+                       f"{remote}/assets")
+            return True
+
+    rec = deploy(project, ui=SwapUI())
+    assert rec.status == "partial" and "symlink" in rec.failed[0].error
+    with provider(project) as p:
+        assert p.exec(f"cat {remote}-moved/a.css")[1] == "v1"
+
+
+def test_guard_works_on_sftp_only_server(project, sftp_only_server, tmp_path):
+    remote = configure(project, sftp_only_server, f"      password: {PASSWORD}\n")
+    f = tmp_path / "x.txt"
+    f.write_text("x")
+    from shipr.errors import UnsafePath
+
+    with provider(project) as p:
+        p._sftp.mkdir(remote)
+        p._sftp.mkdir(f"{remote}-other")
+        p._sftp.symlink(f"{remote}-other", f"{remote}/linked")
+        with pytest.raises(UnsafePath, match="is a symlink"):
+            p.upload(f, f"{remote}/linked/x.txt")
+        assert p.walk(remote)["linked"].kind == "symlink"
+        assert p._sftp.listdir(f"{remote}-other") == []

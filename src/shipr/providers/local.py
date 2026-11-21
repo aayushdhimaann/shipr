@@ -1,16 +1,31 @@
 """Deploy to a directory on this machine (a mounted share, a local web root, or tests).
 
 Settings: `root` (default "/") — remote paths like /site/index.php map to <root>/site/index.php.
+Symlinks, junctions, special files and unreadable directories are handled exactly like the SFTP
+provider handles them: reported, never followed or written through.
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import stat as statmod
 import subprocess
 from pathlib import Path
 
-from .base import Provider, ProviderError, RemoteStat, tmp_name
+from .base import Provider, ProviderError, RemoteStat, UnsafePath, tmp_name
+
+# Windows: symlinks *and* directory junctions are reparse points (Path.is_symlink misses
+# junctions before Python 3.12)
+_REPARSE = getattr(statmod, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+
+def _kind(st: os.stat_result) -> str:
+    if statmod.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & _REPARSE:
+        return "symlink"
+    if statmod.S_ISDIR(st.st_mode):
+        return "dir"
+    return "file" if statmod.S_ISREG(st.st_mode) else "special"
 
 
 class LocalProvider(Provider):
@@ -25,67 +40,133 @@ class LocalProvider(Provider):
         pass
 
     def _p(self, remote: str) -> Path:
-        return self.root / remote.lstrip("/")
+        # a backslash or drive colon would be a separator or drive on Windows
+        if "\\" in remote or (os.name == "nt" and ":" in remote):
+            raise UnsafePath(f"refusing path {remote!r}")
+        p = self.root / remote.lstrip("/")
+        if p.parts[:len(self.root.parts)] != self.root.parts:
+            raise UnsafePath(f"refusing {remote!r}: outside {self.root}")
+        return p
 
     @staticmethod
     def _stat(p: Path) -> RemoteStat:
-        st = p.stat()
+        st = p.lstat()
         return RemoteStat(st.st_size, int(st.st_mtime), st.st_mode & 0o7777)
 
+    # confinement primitives (checks live in Provider) -----------------------
+    def _lkind(self, path: str) -> str | None:
+        try:
+            return _kind(os.lstat(self._p(path)))
+        except FileNotFoundError:
+            return None
+
+    def _mkdir(self, path: str) -> None:
+        self._p(path).mkdir()
+
+    def _mkdir_tree(self, path: str) -> None:
+        self._p(path).mkdir(parents=True, exist_ok=True)
+
+    def _usable(self, path: str) -> bool:
+        """Parents are real directories and `path` is a regular file."""
+        return self._check_dirs(path) and self._check_target(path) == "file"
+
+    # files ------------------------------------------------------------------
     def stat(self, path: str) -> RemoteStat | None:
-        p = self._p(path)
-        return self._stat(p) if p.is_file() else None
+        if not self._check_dirs(path) or self._lkind(path) != "file":
+            return None
+        return self._stat(self._p(path))
 
     def walk(self, root: str, skip: str | None = None) -> dict[str, RemoteStat]:
+        if not self._check_dirs(root):
+            return {}
+        if self.roots and root not in self.roots and self._lkind(root) not in (None, "dir"):
+            raise UnsafePath(f"refusing to list {root}: it is not a directory")
         base = self._p(root)
         skip_p = self._p(skip) if skip else None
         out: dict[str, RemoteStat] = {}
-        for dirpath, dirnames, filenames in os.walk(base):
-            dirnames[:] = [d for d in dirnames if Path(dirpath, d) != skip_p]
-            for f in filenames:
-                p = Path(dirpath, f)
-                if p.is_file():
-                    out[p.relative_to(base).as_posix()] = self._stat(p)
+
+        def unreadable(e: OSError) -> None:
+            p = Path(e.filename)
+            if p == base:
+                if isinstance(e, FileNotFoundError):
+                    return
+                raise ProviderError(f"cannot list {root}: {e.strerror}")
+            out[p.relative_to(base).as_posix()] = RemoteStat(0, 0, kind="unreadable")
+
+        for dirpath, dirnames, filenames in os.walk(base, onerror=unreadable):
+            descend = []
+            for name in dirnames + filenames:
+                p = Path(dirpath, name)
+                st = os.lstat(p)
+                kind = _kind(st)
+                rel = p.relative_to(base).as_posix()
+                if kind == "dir":
+                    if p != skip_p:
+                        descend.append(name)
+                elif kind == "file":
+                    out[rel] = RemoteStat(st.st_size, int(st.st_mtime), st.st_mode & 0o7777)
+                else:
+                    out[rel] = RemoteStat(st.st_size, int(st.st_mtime), kind=kind)
+            dirnames[:] = descend  # os.walk lists symlinked dirs here: never descend into them
         return out
 
     def upload(self, local: Path, remote: str, mode: int | None = None) -> RemoteStat:
-        dst = self._p(remote)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._p(tmp_name(remote))
-        shutil.copyfile(local, tmp)
+        self._ensure_dirs(remote)
+        self._check_target(remote)
+        tmp = tmp_name(remote)
+        tmp_kind = self._lkind(tmp)
+        if tmp_kind == "dir":
+            raise UnsafePath(f"refusing {remote}: {tmp} is a directory")
+        if tmp_kind in ("symlink", "special"):
+            self._p(tmp).unlink()  # unlinking removes the link itself, never its target
+        shutil.copyfile(local, self._p(tmp))
         if mode is not None:
-            os.chmod(tmp, mode)
-        os.replace(tmp, dst)
-        return self._stat(dst)
+            os.chmod(self._p(tmp), mode)
+        if not self._check_dirs(remote):  # re-check right before the replace
+            raise FileNotFoundError(remote)
+        self._check_target(remote)
+        os.replace(self._p(tmp), self._p(remote))
+        return self._stat(self._p(remote))
 
     def download(self, remote: str, local: Path) -> None:
+        if not self._usable(remote):
+            raise FileNotFoundError(remote)
         shutil.copyfile(self._p(remote), local)
 
     def delete(self, path: str) -> None:
+        if not self._usable(path):
+            raise FileNotFoundError(path)
         self._p(path).unlink()
 
     def rename(self, src: str, dst: str) -> None:
+        if not self._usable(src):
+            raise FileNotFoundError(src)
+        self._ensure_dirs(dst)
+        if not (self._usable(src) and self._check_dirs(dst)):  # re-check both sides
+            raise FileNotFoundError(src)
         d = self._p(dst)
-        if d.exists():
+        if os.path.lexists(d):
             raise ProviderError(f"{dst} already exists")
-        d.parent.mkdir(parents=True, exist_ok=True)
         os.rename(self._p(src), d)
 
     def rmdir_if_empty(self, path: str) -> bool:
         try:
+            if not self._check_dirs(path) or self._lkind(path) != "dir":
+                return False
             self._p(path).rmdir()
             return True
-        except OSError:
+        except (OSError, UnsafePath):
             return False
 
     def create_exclusive(self, path: str, text: str) -> bool:
+        self._ensure_dirs(path)
         p = self._p(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with p.open("x", encoding="utf-8") as f:
+            with p.open("x", encoding="utf-8") as f:  # O_EXCL: fails on a symlink too
                 f.write(text)
             return True
         except FileExistsError:
+            self._check_target(path)
             return False
 
     def supports_exec(self) -> bool:

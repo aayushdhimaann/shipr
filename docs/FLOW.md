@@ -276,7 +276,11 @@ flowchart TD
   val -- bad --> e["UnsafePath: stop before any change"]
   val --> loop["each local file"]
   val --> mloop["each manifest entry with no local file"]
-  loop --> p{"protected and present on server?"}
+  loop --> bl{"it or a folder above it is a symlink,<br/>special file or unreadable dir on the server?"}
+  mloop --> bl2{"same check"}
+  bl -- yes --> skip["skip · left untouched, reported"]
+  bl2 -- yes --> skip
+  bl -- no --> p{"protected and present on server?"}
   p -- yes --> prot["leave untouched"]
   p -- no --> inm{"in manifest?"}
   inm -- yes --> onr{"on server?"}
@@ -294,7 +298,7 @@ flowchart TD
   hash --> eq{"same content?"}
   eq -- yes --> ad["adopt · record in manifest, no upload"]
   eq -- no --> u5
-  mloop --> gone{"still on server?"}
+  bl2 -- no --> gone{"still on server?"}
   gone -- no --> fg["forget the entry"]
   gone -- yes --> pr2{"protected?"}
   pr2 -- yes --> prot
@@ -305,6 +309,14 @@ flowchart TD
   class hash srv
 ```
 
+- **Server symlinks.** A file at or under a server symlink, special file or unreadable directory
+  is never uploaded, deleted or forgotten, so shipr can't write through it into another folder.
+  Providers re-check every directory with `lstat` right before each change, which catches a
+  symlink that appears after planning. That file then fails and the deploy ends `partial`.
+- **Leftovers.** Temp and parked files from an interrupted upload of a managed file are taken out
+  of R. A park is removed after the run only if it matches the deployed version or a backup.
+  Otherwise the deploy stops before any change. Look-alikes of other files are ordinary server
+  files.
 - **Files shipr never deployed.** A file that is on the server but in neither L nor M (user uploads, logs, server-only config) is never planned, so it can't be overwritten or deleted.
 - **Why size + mtime for the server.** Reading them costs one directory listing per folder; hashing would mean downloading every file. The limit: an edit that keeps both the size and the old mtime goes unnoticed.
 

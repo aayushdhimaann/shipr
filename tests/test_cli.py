@@ -50,3 +50,21 @@ def test_errors_are_clean_messages_with_exit_codes(project, monkeypatch):
     r = CliRunner().invoke(cli, ["deploy", "-e", "nope"])
     assert r.exit_code == 1 and "unknown environment 'nope'" in r.output
     assert "Traceback" not in r.output
+
+
+def test_validate_reports_state_overlaps(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "shipr.yml").write_text(
+        "version: 1\nenvironments:\n"
+        "  prod: {remote_path: /var/www/html, sftp: {host: a.example.com, username: u}}\n"
+        "  staging: {remote_path: /var/www/html, sftp: {host: b.example.com, username: u}}\n")
+    r = CliRunner().invoke(cli, ["validate"])
+    assert r.exit_code == 0 and r.output.count("can't tell whether") == 1, r.output
+    (tmp_path / "shipr.yml").write_text(
+        "version: 1\nenvironments:\n"
+        "  prod: {remote_path: /var/www/html, sftp: {host: a.example.com, username: u}}\n"
+        "  staging: {remote_path: /var/www/html/staging, sftp: {host: a.example.com, "
+        "username: u}}\n")
+    for args in (["validate"], ["status", "-e", "prod"], ["deploy", "-e", "staging"]):
+        r = CliRunner().invoke(cli, args)
+        assert r.exit_code == 1 and "same server" in r.output, (args, r.output)

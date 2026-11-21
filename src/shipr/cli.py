@@ -61,7 +61,10 @@ class Ctx:
                 raise click.UsageError(f"choose an environment with -e "
                                        f"({', '.join(cfg.environments)})")
             name = next(iter(cfg.environments))
-        return cfg, cfg.env(name)
+        env = cfg.env(name)
+        for w in cfg.state_overlaps(name):  # raises when two envs certainly share records
+            click.echo(f"warning: {w}")
+        return cfg, env
 
 
 env_option = click.option("-e", "--env", "env_name", help="Environment name from shipr.yml.")
@@ -105,9 +108,13 @@ def init(force: bool) -> None:
 def validate(obj: Ctx) -> None:
     """Check shipr.yml for every environment."""
     cfg = obj.cfg()
+    warnings: list[str] = []
     for name in cfg.environments:
         env = cfg.env(name)
+        warnings += [w for w in cfg.state_overlaps(name) if w not in warnings]
         click.echo(f"{name}: ok ({env.provider} → {env.remote_path})")
+    for w in warnings:
+        click.echo(f"warning: {w}")
 
 
 @cli.command("test")

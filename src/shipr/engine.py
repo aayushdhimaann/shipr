@@ -12,17 +12,16 @@ from dataclasses import dataclass
 
 from . import gitops, providers
 from .config import Config, Environment
-from .errors import Aborted, DeployError, ProviderError
+from .errors import Aborted, DeployError, ProviderError, UnsafePath
 from .executor import PlanExecutor
 from .hooks import remote_exec_available, run_local, run_remote_phase
 from .models import DeployRecord, InProgress, Kind, Manifest
 from .planner import Op, Plan, make_plan, safe_join
 from .providers import Provider, RemoteStat
+from .providers.base import leftover_of
 from .state import RemoteState, new_deploy_id, now_iso, whoami
 from .ui import UI, show_plan, show_result
 from .workspace import Workspace, prepare
-
-LEFTOVER_SUFFIXES = (".shipr-tmp", ".shipr-old")  # from uploads interrupted mid-swap
 
 
 @dataclass(frozen=True)
@@ -37,6 +36,7 @@ class DeployOptions:
 def open_provider(env: Environment, trust_new_host: bool = False) -> Provider:
     provider = providers.get(env.provider)(env.provider_settings, trust_new_host=trust_new_host)
     provider.exec_allowed = env.ssh_exec is not False
+    provider.roots = (env.remote_path, env.effective_state_path)
     return provider
 
 
@@ -73,7 +73,7 @@ class Deployment:
             id=new_deploy_id(ws.sha), kind=options.kind, project=cfg.project_name,
             environment=env.name, commit=ws.sha, branch=ws.branch, subject=ws.subject,
             by=whoami(), target=provider.describe(), started=now_iso())
-        self._stale_tmp: list[str] = []
+        self._leftovers: list[str] = []  # shipr's own leftovers, safe to remove after the run
 
     def run(self) -> DeployRecord:
         if self.options.dry_run:  # read-only: no lock, no writes
@@ -105,13 +105,62 @@ class Deployment:
         manifest = self.state.load_manifest()
         self._warn_about(manifest)
         remote = scan_remote(self.env, self.provider, self.state)
-        self._stale_tmp = [r for r in remote if r.endswith(LEFTOVER_SUFFIXES)]
-        for r in self._stale_tmp:
-            del remote[r]
+        self._leftovers = self._own_leftovers(manifest, remote)
         plan = make_plan(self.ws.files, manifest.files, remote, self.ws.rules,
                          self._remote_hashes, reserved=self.env.state_rel)
         show_plan(self.ui, plan, self.ws.renames_since(manifest.deployed_commit))
+        if plan.blocked:
+            self.record.blocked = [rel for rel, _ in plan.blocked]
+            self.ui.warn(f"{len(plan.blocked)} paths left untouched: the server has a symlink, "
+                         "special file or unreadable directory there (see `skip` above)")
         return manifest, remote, plan
+
+    def _own_leftovers(self, manifest: Manifest, remote: dict[str, RemoteStat]) -> list[str]:
+        """Temp and park files from interrupted uploads of files shipr manages. They are taken
+        out of `remote` (not site files) and returned for removal after the run. A park holds
+        the server's previous copy of a file: unless it provably matches the deployed version
+        or a backup, it may be the only copy, so stop before changing anything. Look-alikes
+        of files shipr doesn't manage are ordinary server files and stay untouched."""
+        managed = set(manifest.files) | set(self.ws.files)
+        tmps, parks = [], []
+        for rel, r in remote.items():
+            own = leftover_of(rel)
+            if own and r.kind == "file" and own[1] in managed:
+                (tmps if own[0] == "tmp" else parks).append((rel, own[1]))
+        for rel, _ in tmps + parks:
+            del remote[rel]
+        unproven = self._unproven_parks(parks, manifest)
+        if unproven:
+            raise DeployError(
+                "refusing to deploy: shipr cannot prove these files are recoverable. Each holds "
+                "the previous server copy of a file, parked by an upload that was interrupted, "
+                "and matches neither the deployed version nor a backup, so it may be the only "
+                "copy of changes made on the server:\n"
+                + "\n".join(f"  {safe_join(self.env.remote_path, p)}  (previous copy of {b})"
+                            for p, b in unproven)
+                + "\nInspect each one, move it out of the deploy folder (or delete it if it "
+                "isn't needed), then deploy again.")
+        return [rel for rel, _ in tmps + parks]
+
+    def _unproven_parks(self, parks: list[tuple[str, str]],
+                        manifest: Manifest) -> list[tuple[str, str]]:
+        if not parks:
+            return []
+        copies = self.state.backup_copies({base for _, base in parks})
+        abs_park = {rel: safe_join(self.env.remote_path, rel) for rel, _ in parks}
+        paths = list(abs_park.values()) + [p for ps in copies.values() for p in ps]
+        # hash by downloading, not via sha256sum output (C-16: its parsing is not trusted yet)
+        digest = Provider.sha256(self.provider, paths)
+        unproven = []
+        for rel, base in parks:
+            h = digest.get(abs_park[rel])
+            entry = manifest.files.get(base)
+            known = {digest.get(c) for c in copies.get(base, [])}
+            if entry:
+                known.add(entry.sha256)
+            if not h or h not in known:
+                unproven.append((rel, base))
+        return unproven
 
     def _warn_about(self, manifest: Manifest) -> None:
         if manifest.in_progress:
@@ -162,7 +211,7 @@ class Deployment:
         try:
             PlanExecutor(self.provider, self.state, manifest, record, self.ws.files, remote,
                          env.remote_path, self.ui).run(plan, deletes)
-            self._remove_stale_tmp()
+            self._remove_leftovers()
             record.status = "partial" if record.failed else "success"
             if record.failed and env.hooks.remote_after:
                 self.ui.warn("some files failed; remote_after hooks skipped")
@@ -178,12 +227,13 @@ class Deployment:
             record.duration_s = round(time.monotonic() - t0, 2)
             self._save(manifest)
 
-    def _remove_stale_tmp(self) -> None:
-        for r in self._stale_tmp:
+    def _remove_leftovers(self) -> None:
+        for rel in self._leftovers:
             try:
-                self.provider.delete(safe_join(self.env.remote_path, r))
-            except (OSError, ProviderError):
-                pass  # harmless leftovers; retried next deploy
+                self.provider.delete(safe_join(self.env.remote_path, rel))
+                self.record.cleaned.append(rel)
+            except (OSError, ProviderError, UnsafePath):
+                pass  # verified leftovers; retried next deploy
 
     def _save(self, manifest: Manifest) -> None:
         """Persist progress whatever happened; an interrupted run keeps `in_progress`."""

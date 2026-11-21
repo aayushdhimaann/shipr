@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 import posixpath
+import re
+import secrets
 import tempfile
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar
 
 # re-exported: provider authors import these from here
-from ..errors import ConnectionLost, ExecNotSupported, ProviderError
+from ..errors import ConnectionLost, ExecNotSupported, ProviderError, UnsafePath
 
 __all__ = ["ConnectionLost", "ExecNotSupported", "Provider", "ProviderError", "RemoteStat",
-           "tmp_name"]
+           "UnsafePath", "is_within", "leftover_of", "park_name", "tmp_name"]
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,10 @@ class RemoteStat:
     size: int
     mtime: int
     mode: int | None = None  # permission bits only
+    # "file", or an entry shipr must never go through: "symlink", "special" (device, fifo,
+    # socket) or "unreadable" (a directory it cannot list). Providers that only report regular
+    # files can ignore this.
+    kind: str = "file"
 
 
 class Provider(ABC):
@@ -34,6 +40,9 @@ class Provider(ABC):
         self.settings = settings
         self.trust_new_host = trust_new_host
         self.exec_allowed = True  # engine sets False for `ssh_exec: false`
+        # engine sets (remote_path, state_path): every path below them must be reached through
+        # real directories only (see confined()); empty = no confinement
+        self.roots: tuple[str, ...] = ()
 
     # lifecycle -----------------------------------------------------------
     @abstractmethod
@@ -140,7 +149,115 @@ class Provider(ABC):
         """Extra lines for `shipr test` (host key, login dir, ...)."""
         return []
 
+    # confinement ---------------------------------------------------------
+    def confined(self, path: str) -> list[str]:
+        """The directories strictly between `path` and the outermost root containing it,
+        outermost first. Each must be a real directory, not a symlink, when `path` is used.
+
+        Containment compares path components, never string prefixes. A non-canonical path
+        (`..`, `.`, `//`, relative) is refused rather than normalised: shipr only builds
+        canonical paths, so one that isn't means a bug or tampering. No roots: no confinement.
+        """
+        if not self.roots:
+            return []
+        parts = _canonical_parts(path)
+        best: tuple[str, ...] | None = None
+        for root in self.roots:
+            rp = _canonical_parts(root)
+            if parts[:len(rp)] == rp and (best is None or len(rp) < len(best)):
+                best = rp
+        if best is None:
+            raise UnsafePath(f"refusing {path}: outside {', '.join(self.roots)}")
+        return ["/" + "/".join(parts[1:i]) for i in range(len(best) + 1, len(parts))]
+
+    # Built-in providers implement these two (lstat semantics: never follow the last
+    # component) and get the checks below; third-party providers may ignore them.
+    def _lkind(self, path: str) -> str | None:
+        """'file', 'dir', 'symlink' or 'special' without following symlinks; None if missing."""
+        raise NotImplementedError
+
+    def _mkdir(self, path: str) -> None:
+        raise NotImplementedError
+
+    def _mkdir_tree(self, path: str) -> None:
+        """Create `path` and missing parents, following symlinks: only used for a configured
+        root and the directories above it, which are the user's own choice."""
+        raise NotImplementedError
+
+    def _check_dirs(self, path: str) -> bool:
+        """Fresh lstat of every confined directory of `path`. False if one is missing (so
+        `path` can't exist); UnsafePath if one is a symlink or anything but a directory."""
+        for d in self.confined(path):
+            kind = self._lkind(d)
+            if kind is None:
+                return False
+            if kind != "dir":
+                raise UnsafePath(f"refusing {path}: {d} is a {kind}, not a directory "
+                                 "(shipr never goes through symlinks on the server)")
+        return True
+
+    def _ensure_dirs(self, path: str) -> None:
+        """Create the missing directories of `path`, re-checking each one after creating it:
+        a directory swapped for a symlink right after mkdir is caught before it is used."""
+        dirs = self.confined(path)
+        self._mkdir_tree(posixpath.dirname(dirs[0] if dirs else path))
+        for d in dirs:
+            kind = self._lkind(d)
+            if kind is None:
+                try:
+                    self._mkdir(d)
+                except OSError:
+                    if self._lkind(d) is None:
+                        raise  # a real failure (permissions, disk), not a concurrent mkdir
+                kind = self._lkind(d)
+            if kind != "dir":
+                raise UnsafePath(f"refusing {path}: {d} is a {kind}, not a directory "
+                                 "(shipr never goes through symlinks on the server)")
+
+    def _check_target(self, path: str) -> str | None:
+        """The final component must be absent or a regular file (never a symlink)."""
+        kind = self._lkind(path)
+        if kind not in (None, "file"):
+            raise UnsafePath(f"refusing {path}: it is a {kind}, not a regular file")
+        return kind
+
+
+def _canonical_parts(path: str) -> tuple[str, ...]:
+    if (not path.startswith("/") or path.startswith("//") or "\\" in path or "\0" in path
+            or posixpath.normpath(path) != path):
+        raise UnsafePath(f"refusing non-canonical remote path {path!r}")
+    return PurePosixPath(path).parts
+
+
+def is_within(path: str, root: str) -> bool:
+    """`path` is `root` or below it, comparing components (so /a/bc is not within /a/b)."""
+    p, r = PurePosixPath(path).parts, PurePosixPath(root).parts
+    return p[:len(r)] == r
+
 
 def tmp_name(remote: str) -> str:
     d, base = posixpath.split(remote)
     return posixpath.join(d, f".{base}.shipr-tmp")
+
+
+def park_name(remote: str) -> str:
+    """Where a non-atomic swap parks the old file: unique, so a leftover from an earlier crash
+    can never block (or be overwritten by) a later swap."""
+    d, base = posixpath.split(remote)
+    return posixpath.join(d, f".{base}.{secrets.token_hex(4)}.shipr-old")
+
+
+_PARK = re.compile(r"\.(.+)\.[0-9a-f]{8}\.shipr-old")
+
+
+def leftover_of(path: str) -> tuple[str, str] | None:
+    """("tmp" | "park", path of the file it belongs to) for shipr's own leftover names."""
+    d, name = posixpath.split(path)
+    m = _PARK.fullmatch(name)
+    if m:
+        return "park", posixpath.join(d, m.group(1))
+    if name.startswith(".") and name.endswith(".shipr-tmp") and len(name) > len("..shipr-tmp"):
+        return "tmp", posixpath.join(d, name[1:-len(".shipr-tmp")])
+    if name.endswith(".shipr-old") and len(name) > len(".shipr-old"):
+        return "park", posixpath.join(d, name[:-len(".shipr-old")])  # pre-0.2 name
+    return None

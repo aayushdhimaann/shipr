@@ -10,7 +10,7 @@ from .engine import open_provider, scan_remote, state_for
 from .errors import DeployError, ProviderError
 from .hooks import remote_exec_available
 from .models import DeployRecord, Manifest
-from .planner import stat_matches
+from .planner import blocked_reason, stat_matches
 from .ui import UI
 
 
@@ -27,10 +27,14 @@ def status(env: Environment) -> Status:
         state = state_for(env, provider)
         manifest = state.load_manifest()
         remote = scan_remote(env, provider, state)
+        opaque = {rel: r.kind for rel, r in remote.items() if r.kind != "file"}
         drift = []
         for rel, entry in sorted(manifest.files.items()):
             r = remote.get(rel)
-            if r is None:
+            why = blocked_reason(rel, opaque)
+            if why:
+                drift.append((rel, why))
+            elif r is None:
                 drift.append((rel, "missing on server"))
             elif not stat_matches(entry, r):
                 drift.append((rel, "changed on server"))
@@ -69,8 +73,12 @@ def check_connection(env: Environment, trust: bool, ui: UI) -> bool:
             ui.echo(f"cannot write to {state.root}: {e}")
             return False
 
-        n = len(scan_remote(env, provider, state))
-        ui.echo(f"remote_path {env.remote_path}: {n} files found")
+        remote = scan_remote(env, provider, state)
+        opaque = sorted(rel for rel, r in remote.items() if r.kind != "file")
+        ui.echo(f"remote_path {env.remote_path}: {len(remote) - len(opaque)} files found")
+        if opaque:
+            ui.echo(f"{len(opaque)} symlinks, special files or unreadable directories are "
+                    "never touched: " + ", ".join(opaque[:5]) + (" ..." if len(opaque) > 5 else ""))
         try:
             can = remote_exec_available(env, provider)
         except DeployError as e:

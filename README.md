@@ -180,7 +180,8 @@ environments:
     provider: sftp               # sftp | local | a plugin
     branch: main                 # what `shipr deploy` deploys by default (default: current HEAD)
     remote_path: /var/www/html   # absolute, normalised path on the server; "/" is refused
-    state_path: null             # where shipr keeps its records (default: <remote_path>/.shipr)
+    state_path: null             # where shipr keeps its records (default: <remote_path>/.shipr);
+                                 # a directory of its own: not remote_path or a parent of it
     confirm: false               # ask before deploying (use for production)
     ssh_exec: auto               # auto | true | false: run hooks over SSH?
     sftp:
@@ -255,6 +256,11 @@ Everything lives in `state_path` on the server, so every teammate sees the same 
 If `state_path` is inside `remote_path`, shipr writes a `.htaccess` that denies web access
 (Apache). On nginx, either deny `/.shipr` in the server config or set `state_path` outside the web
 root, for example `/home/deploy/.shipr/my-app`. Backups are never deleted automatically.
+
+`state_path` must be a directory of its own. It may not be `remote_path` or one of its parents.
+Two environments on the same server may not share state, nest their state dirs, or keep state
+inside each other's `remote_path`. `shipr validate` rejects these setups. When shipr can't tell
+whether two hosts are the same server, it warns instead.
 
 ## Commands
 
@@ -417,6 +423,11 @@ older commit.
   never uploaded.
 - **Path checks.** Every path is validated before anything changes. Nothing outside `remote_path`
   is touched, and shipr's own state directory cannot be overwritten.
+- **Server symlinks.** shipr never writes, reads or deletes through a symlink, special file or
+  unreadable directory on the server. Files at or under one are listed as `skip ... left
+  untouched`. A symlink that appears mid-deploy fails that file instead of being followed.
+- **Interrupted uploads.** Leftover temp and "parked" files are only removed when shipr can
+  prove they are its own and recoverable. Otherwise the deploy stops and tells you what to check.
 - **Deletions.** Only files shipr itself deployed can be deleted. You are always asked, and a
   "deleted" file is really moved into a backup folder.
 - **Permissions.** A replaced file keeps the server's permissions. New files keep their executable

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import posixpath
 
-from .errors import ConnectionLost, ProviderError
+from .errors import ConnectionLost, ProviderError, UnsafePath
 from .files import LocalFile
 from .models import DeletedFile, DeployRecord, FailedFile, FileEntry, Manifest, UploadedFile
 from .planner import Op, Plan, safe_join
@@ -14,9 +14,9 @@ from .state import RemoteState
 from .ui import UI
 
 CHECKPOINT_EVERY = 25
-# Per-file problems (permission denied, disk full) are recorded and the deploy continues;
-# ConnectionLost stops it.
-FILE_ERRORS = (OSError, ProviderError)
+# Per-file problems (permission denied, disk full, a symlink that appeared on the server after
+# planning) are recorded and the deploy continues; ConnectionLost stops it.
+FILE_ERRORS = (OSError, ProviderError, UnsafePath)
 
 
 class PlanExecutor:

@@ -98,8 +98,8 @@ class RemoteState:
     def list_history(self) -> list[DeployRecord]:
         """Oldest first (deploy ids start with a UTC timestamp)."""
         out = []
-        for name in sorted(self.provider.walk(self._path("history"))):
-            if not name.endswith(".json"):
+        for name, r in sorted(self.provider.walk(self._path("history")).items()):
+            if not name.endswith(".json") or r.kind != "file":
                 continue
             text = self.provider.read_text(self._path("history", name))
             try:
@@ -110,3 +110,12 @@ class RemoteState:
 
     def backup_path(self, deploy_id: str, rel: str) -> str:
         return self._path("backups", deploy_id, rel)
+
+    def backup_copies(self, rels: set[str]) -> dict[str, list[str]]:
+        """Every backup of each deploy-relative path, across all deploys (absolute paths)."""
+        out: dict[str, list[str]] = {}
+        for name, r in self.provider.walk(self._path("backups")).items():
+            _, _, rel = name.partition("/")  # <deploy-id>/<rel>
+            if rel in rels and r.kind == "file":
+                out.setdefault(rel, []).append(self._path("backups", name))
+        return out

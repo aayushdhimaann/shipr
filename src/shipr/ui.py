@@ -31,8 +31,11 @@ def show_plan(ui: UI, plan: Plan, renames: dict[str, str]) -> None:
         ui.echo(f"  delete  {op.path}{hint}")
     for rel in plan.protected:
         ui.echo(f"  protect {rel}  (protected: left untouched)")
+    for rel, why in plan.blocked:
+        ui.echo(f"  skip    {rel}  ({why}: left untouched)")
     ui.echo(f"{len(plan.uploads)} to upload, {len(plan.deletes)} to delete, "
-            f"{plan.unchanged + len(plan.adopt)} unchanged, {len(plan.protected)} protected")
+            f"{plan.unchanged + len(plan.adopt)} unchanged, {len(plan.protected)} protected"
+            + (f", {len(plan.blocked)} left untouched" if plan.blocked else ""))
 
 
 def show_result(ui: UI, record: DeployRecord) -> None:

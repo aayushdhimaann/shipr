@@ -20,9 +20,9 @@ from typing import Any, TypeVar
 import paramiko
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from ..errors import ConnectionLost, ProviderError
+from ..errors import ConnectionLost, ProviderError, UnsafePath
 from ..paths import app_dir
-from .base import Provider, RemoteStat, tmp_name
+from .base import Provider, RemoteStat, park_name, tmp_name
 
 T = TypeVar("T")
 TRANSIENT = (paramiko.SSHException, EOFError, socket.timeout, ConnectionError)
@@ -61,16 +61,18 @@ def _remote_stat(a: paramiko.SFTPAttributes) -> RemoteStat:
                       statmod.S_IMODE(a.st_mode) if a.st_mode else None)
 
 
-def _is_dir(a: paramiko.SFTPAttributes) -> bool:
-    return statmod.S_ISDIR(a.st_mode or 0)
-
-
-def _is_file(a: paramiko.SFTPAttributes) -> bool:
-    return statmod.S_ISREG(a.st_mode or 0)
+def _kind(a: paramiko.SFTPAttributes) -> str:
+    mode = a.st_mode or 0
+    if statmod.S_ISLNK(mode):
+        return "symlink"
+    if statmod.S_ISDIR(mode):
+        return "dir"
+    return "file" if statmod.S_ISREG(mode) else "special"
 
 
 def _attrs(sftp: paramiko.SFTPClient, path: str) -> paramiko.SFTPAttributes | None:
-    """stat() that returns None for a missing path (follows symlinks)."""
+    """stat() that returns None for a missing path (follows symlinks: only used at or above a
+    configured root)."""
     try:
         return sftp.stat(path)
     except FileNotFoundError:
@@ -178,11 +180,48 @@ class SFTPProvider(Provider):
                     pass  # the next attempt fails fast and counts against retries
         raise AssertionError("unreachable")
 
+    # confinement primitives (checks live in Provider) ---------------------------
+    # SFTP is path-based: there is no O_NOFOLLOW or openat, so every check below is a fresh
+    # lstat made right before the request it guards. A process that can write to the tree can
+    # still swap a symlink in between the two (see docs/security.md).
+    def _lkind(self, path: str) -> str | None:
+        try:
+            return _kind(self._sftp.lstat(path))
+        except FileNotFoundError:
+            return None
+
+    def _mkdir(self, path: str) -> None:
+        self._sftp.mkdir(path)
+
+    def _mkdir_tree(self, path: str) -> None:
+        missing = []
+        while path not in ("/", "") and _attrs(self._sftp, path) is None:
+            missing.append(path)
+            path = posixpath.dirname(path)
+        for m in reversed(missing):
+            try:
+                self._sftp.mkdir(m)
+            except OSError:
+                a = _attrs(self._sftp, m)
+                if not (a and statmod.S_ISDIR(a.st_mode or 0)):  # concurrent mkdir is fine
+                    raise
+
+    def _usable(self, path: str) -> bool:
+        """Parents are real directories and `path` is a regular file."""
+        return self._check_dirs(path) and self._check_target(path) == "file"
+
+    # Every op below runs inside _retry, so its checks are redone after a reconnect.
+
     # files -----------------------------------------------------------------
     def stat(self, path: str) -> RemoteStat | None:
         def op(sftp: paramiko.SFTPClient) -> RemoteStat | None:
-            a = _attrs(sftp, path)
-            return _remote_stat(a) if a and _is_file(a) else None
+            if not self._check_dirs(path):
+                return None
+            try:
+                a = sftp.lstat(path)
+            except FileNotFoundError:
+                return None
+            return _remote_stat(a) if _kind(a) == "file" else None
         return self._retry(op)
 
     def _listdir(self, d: str) -> list[paramiko.SFTPAttributes]:
@@ -194,96 +233,135 @@ class SFTPProvider(Provider):
         return self._retry(op)
 
     def walk(self, root: str, skip: str | None = None) -> dict[str, RemoteStat]:
+        def root_ok(sftp: paramiko.SFTPClient) -> bool:
+            if not self._check_dirs(root):
+                return False
+            if self.roots and root not in self.roots and self._lkind(root) not in (None, "dir"):
+                raise UnsafePath(f"refusing to list {root}: it is not a directory")
+            return True
+
+        if not self._retry(root_ok):
+            return {}
         out: dict[str, RemoteStat] = {}
         pending = [(root, "")]
         while pending:
             d, rel = pending.pop()
-            for a in self._listdir(d):
-                path = posixpath.join(d, a.filename)
-                if _is_dir(a) and path != skip:
-                    pending.append((path, f"{rel}{a.filename}/"))
-                elif _is_file(a):
-                    out[rel + a.filename] = _remote_stat(a)
-                # symlinks and special files are reported by READDIR as neither: never touched
-        return out
-
-    @staticmethod
-    def _mkdirs(sftp: paramiko.SFTPClient, d: str) -> None:
-        missing = []
-        while d not in ("/", "") and _attrs(sftp, d) is None:
-            missing.append(d)
-            d = posixpath.dirname(d)
-        for m in reversed(missing):
             try:
-                sftp.mkdir(m)
-            except OSError:
-                a = _attrs(sftp, m)
-                if not (a and _is_dir(a)):  # created concurrently is fine; else a real error
-                    raise
+                entries = self._listdir(d)
+            except OSError as e:
+                if not rel:
+                    raise ProviderError(f"cannot list {root}: {e}") from None
+                # permission denied (or a server-side failure): report it, never guess
+                out[rel[:-1]] = RemoteStat(0, 0, kind="unreadable")
+                continue
+            for a in entries:
+                path = posixpath.join(d, a.filename)
+                kind = _kind(a)  # READDIR attrs are lstat attrs: a symlink is reported as one
+                if kind == "dir":
+                    if path != skip:
+                        pending.append((path, f"{rel}{a.filename}/"))
+                elif kind == "file":
+                    out[rel + a.filename] = _remote_stat(a)
+                else:
+                    out[rel + a.filename] = RemoteStat(a.st_size or 0, int(a.st_mtime or 0),
+                                                       kind=kind)
+        return out
 
     @staticmethod
     def _replace(sftp: paramiko.SFTPClient, src: str, dst: str) -> None:
         """Move src over dst. Atomic where the server supports posix-rename; otherwise dst is
-        parked aside and restored if the swap fails, so it is never simply lost."""
+        parked under a unique name and put back if the swap fails, so it is never simply lost.
+        A park left by a crash here is judged by the engine, never deleted blindly."""
         try:
             sftp.posix_rename(src, dst)  # OpenSSH extension
             return
         except OSError:
             sftp.stat(src)  # src gone? then the failure was real, not "unsupported": re-raise
-        parked = dst + ".shipr-old"
+        parked: str | None = park_name(dst)
         try:
             sftp.rename(dst, parked)
         except FileNotFoundError:
             parked = None
         try:
             sftp.rename(src, dst)
-        except OSError:
+        except OSError as e:
             if parked:
-                sftp.rename(parked, dst)
+                try:
+                    sftp.rename(parked, dst)
+                except OSError as restore:
+                    raise ProviderError(f"could not replace {dst} ({e}) nor put it back "
+                                        f"({restore}); its previous content is kept at "
+                                        f"{parked}") from e
             raise
         if parked:
             sftp.remove(parked)
 
     def upload(self, local: Path, remote: str, mode: int | None = None) -> RemoteStat:
         def op(sftp: paramiko.SFTPClient) -> RemoteStat:
-            self._mkdirs(sftp, posixpath.dirname(remote))
+            self._ensure_dirs(remote)
+            self._check_target(remote)
             tmp = tmp_name(remote)
+            tmp_kind = self._lkind(tmp)
+            if tmp_kind == "dir":
+                raise UnsafePath(f"refusing {remote}: {tmp} is a directory")
+            if tmp_kind in ("symlink", "special"):
+                sftp.remove(tmp)  # removes the link itself, never its target
             sftp.put(str(local), tmp, confirm=True)
             if mode is not None:
                 sftp.chmod(tmp, mode)
+            if not self._check_dirs(remote):  # re-check right before the swap
+                raise FileNotFoundError(remote)
+            self._check_target(remote)
             self._replace(sftp, tmp, remote)
-            return _remote_stat(sftp.stat(remote))
+            return _remote_stat(sftp.lstat(remote))
         return self._retry(op)
 
     def download(self, remote: str, local: Path) -> None:
-        self._retry(lambda sftp: sftp.get(remote, str(local)))
+        def op(sftp: paramiko.SFTPClient) -> None:
+            if not self._usable(remote):
+                raise FileNotFoundError(remote)
+            sftp.get(remote, str(local))
+        self._retry(op)
 
     def delete(self, path: str) -> None:
-        self._retry(lambda sftp: sftp.remove(path))
+        def op(sftp: paramiko.SFTPClient) -> None:
+            if not self._usable(path):
+                raise FileNotFoundError(path)
+            sftp.remove(path)
+        self._retry(op)
 
     def rename(self, src: str, dst: str) -> None:
         def op(sftp: paramiko.SFTPClient) -> None:
-            self._mkdirs(sftp, posixpath.dirname(dst))
+            if not self._usable(src):
+                raise FileNotFoundError(src)
+            self._ensure_dirs(dst)
+            if not (self._usable(src) and self._check_dirs(dst)):  # re-check both sides
+                raise FileNotFoundError(src)
             sftp.rename(src, dst)  # plain SFTP rename refuses to overwrite: intended
         self._retry(op)
 
     def rmdir_if_empty(self, path: str) -> bool:
-        try:
-            self._retry(lambda sftp: sftp.rmdir(path))
+        def op(sftp: paramiko.SFTPClient) -> bool:
+            if not self._check_dirs(path) or self._lkind(path) != "dir":
+                return False
+            sftp.rmdir(path)
             return True
-        except OSError:
+        try:
+            return self._retry(op)
+        except (OSError, UnsafePath):
             return False
 
     def create_exclusive(self, path: str, text: str) -> bool:
         def op(sftp: paramiko.SFTPClient) -> bool:
-            self._mkdirs(sftp, posixpath.dirname(path))
+            self._ensure_dirs(path)
             try:
-                # "wx" = WRITE|CREATE|EXCL; paramiko's bare "x" opens without WRITE
+                # "wx" = WRITE|CREATE|EXCL; paramiko's bare "x" opens without WRITE. O_EXCL
+                # also fails on an existing symlink, without following it.
                 with sftp.open(path, "wx") as f:
                     f.write(text.encode("utf-8"))
                 return True
             except OSError:
-                if _attrs(sftp, path) is None:
+                if self._check_target(path) is None:
                     raise ProviderError(f"cannot create {path}") from None
                 with sftp.open(path, "r") as f:
                     existing = f.read().decode("utf-8", "replace")

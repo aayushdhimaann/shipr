@@ -1,13 +1,14 @@
 """End-to-end deploys through the real engine into a local folder acting as the server."""
 
 import json
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
 from shipr import admin, engine
-from shipr.errors import Aborted, LockedError
+from shipr.errors import Aborted, DeployError, LockedError
 from tests.helpers import RecordingUI, deploy, load_env
 
 
@@ -270,3 +271,211 @@ def test_lock_release_only_removes_own_lock(project):
         assert st.read_lock() and "deploy-1" in st.read_lock()
         st.release_lock("deploy-1")
         assert st.read_lock() is None
+
+
+# --- filesystem safety (C-1, C-2, C-7, C-21) ----------------------------------------------------
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks/permissions")
+
+
+def add_env_option(project, line):
+    cfg = project.repo / "shipr.yml"
+    cfg.write_text(cfg.read_text() + f"    {line}\n")
+
+
+@posix_only
+def test_symlinked_server_dir_is_never_written_through(project):
+    project.write_config("files:\n  protect: ['storage/**']\n")
+    shared = project.server / "shared"
+    shared.mkdir()
+    (shared / "data.txt").write_text("PRODUCTION USER DATA")
+    project.site.mkdir(parents=True)
+    (project.site / "storage").symlink_to(shared)
+    project.write("storage/data.txt", "placeholder from git")
+    project.write("storage/deep/new.txt", "n")
+    project.write("index.php", "x")
+    project.commit()
+    ui = RecordingUI()
+    rec = run(project, ui=ui)
+    assert (shared / "data.txt").read_text() == "PRODUCTION USER DATA"
+    assert not (shared / "deep").exists()
+    assert [u.path for u in rec.uploaded] == ["index.php"]
+    assert rec.blocked == ["storage/data.txt", "storage/deep/new.txt"]
+    assert "skip    storage/data.txt  (server has a symlink at storage" in ui.text
+
+
+@posix_only
+def test_symlinked_server_file_is_never_replaced(project):
+    project.write_config("files:\n  protect: ['config.php']\n")
+    real = project.server / "shared.php"
+    real.write_text("REAL DB PASSWORD")
+    project.site.mkdir(parents=True)
+    (project.site / "config.php").symlink_to(real)
+    project.write("config.php", "sample config")
+    project.commit()
+    rec = run(project)
+    assert (project.site / "config.php").is_symlink()
+    assert real.read_text() == "REAL DB PASSWORD" and rec.blocked == ["config.php"]
+
+
+@posix_only
+def test_nested_and_inward_symlinks_are_left_alone(project):
+    project.site.mkdir(parents=True)
+    (project.site / "a" / "b").mkdir(parents=True)
+    (project.site / "real").mkdir()
+    (project.site / "a" / "b" / "c").symlink_to(project.site / "real")  # points back inside
+    project.write("a/b/c/x.txt", "x")
+    project.write("a/b/y.txt", "y")
+    project.commit()
+    rec = run(project)
+    assert rec.blocked == ["a/b/c/x.txt"] and [u.path for u in rec.uploaded] == ["a/b/y.txt"]
+    assert not (project.site / "real" / "x.txt").exists()
+
+
+class SwapUI(RecordingUI):
+    """Says yes, but first replaces a server directory with a symlink (a race after planning)."""
+
+    def __init__(self, swap):
+        super().__init__()
+        self.swap = swap
+
+    def _confirm(self, msg):
+        self.swap()
+        return True
+
+
+def swap_dir_for_link(directory: Path, target: Path) -> None:
+    directory.rename(target)
+    directory.symlink_to(target)
+
+
+@posix_only
+def test_symlink_swapped_in_after_planning_blocks_the_upload(project):
+    project.write("assets/a.css", "v1")
+    project.commit()
+    run(project)
+    project.write("assets/a.css", "v2")
+    project.commit()
+    add_env_option(project, "confirm: true")
+    moved = project.server / "moved-assets"
+    rec = run(project, ui=SwapUI(lambda: swap_dir_for_link(project.site / "assets", moved)))
+    assert rec.status == "partial" and rec.failed[0].path == "assets/a.css"
+    assert "symlink" in rec.failed[0].error
+    assert (moved / "a.css").read_text() == "v1"  # nothing written through the link
+
+
+@posix_only
+def test_symlink_swapped_in_before_deletion_blocks_it(project):
+    project.write("keep.txt", "k")
+    project.write("old/gone.txt", "g")
+    project.commit()
+    run(project)
+    (project.repo / "old" / "gone.txt").unlink()
+    project.commit()
+    moved = project.server / "moved-old"
+    rec = run(project, ui=SwapUI(lambda: swap_dir_for_link(project.site / "old", moved)))
+    assert rec.status == "partial" and rec.failed[0].path == "old/gone.txt"
+    assert (moved / "gone.txt").read_text() == "g"
+
+
+unreadable_ok = pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0,
+                                   reason="needs POSIX permissions and a non-root user")
+
+
+@unreadable_ok
+def test_unreadable_server_dir_does_not_break_the_deploy(project):
+    project.site.mkdir(parents=True)
+    locked = project.site / "cache"
+    locked.mkdir()
+    (locked / "sess").write_text("s")
+    project.write("cache/x.txt", "x")
+    project.write("index.php", "i")
+    project.commit()
+    locked.chmod(0)
+    try:
+        rec = run(project)
+    finally:
+        locked.chmod(0o755)
+    assert rec.status == "success" and [u.path for u in rec.uploaded] == ["index.php"]
+    assert rec.blocked == ["cache/x.txt"]
+
+
+def park(project, rel, text):
+    d, name = os.path.split(rel)
+    p = project.site / d / f".{name}.0123abcd.shipr-old"
+    p.write_text(text)
+    return p
+
+
+def test_unmanaged_leftover_lookalikes_are_never_deleted(project):
+    project.write("a.txt", "a")
+    project.commit()
+    (project.site / "uploads").mkdir(parents=True)
+    keep = [project.site / name for name in (
+        "uploads/report.shipr-old", ".notes.shipr-tmp", "uploads/.x.0123abcd.shipr-old",
+        "a.txt.shipr-old.bak")]
+    for f in keep:
+        f.write_text("user data")
+    run(project)
+    assert all(f.read_text() == "user data" for f in keep)
+
+
+def test_interrupted_swap_is_recovered_and_verified_park_removed(project):
+    project.write("a.txt", "v1")
+    project.commit()
+    run(project)
+    p = park(project, "a.txt", "v1")  # crash after parking: a.txt missing, park holds v1
+    (project.site / "a.txt").unlink()
+    (project.site / ".a.txt.shipr-tmp").write_text("partial")
+    project.write("a.txt", "v2")
+    project.commit()
+    rec = run(project)
+    assert rec.status == "success" and (project.site / "a.txt").read_text() == "v2"
+    assert not p.exists() and not (project.site / ".a.txt.shipr-tmp").exists()
+    # the stale temp file was reused (and renamed into place) by the new upload of a.txt
+    assert rec.cleaned == [".a.txt.0123abcd.shipr-old"]
+
+
+@pytest.mark.parametrize("dst_state", ["missing", "modified"])
+def test_unproven_park_stops_the_deploy_before_any_change(project, dst_state):
+    project.write("a.txt", "v1")
+    project.commit()
+    run(project)
+    p = park(project, "a.txt", "server-side edit nobody backed up")
+    if dst_state == "missing":
+        (project.site / "a.txt").unlink()
+    else:
+        (project.site / "a.txt").write_text("manually modified")
+    project.write("a.txt", "v2")
+    project.commit()
+    before = manifest(project)
+    with pytest.raises(DeployError, match="cannot prove"):
+        run(project)
+    assert p.read_text() == "server-side edit nobody backed up"
+    assert manifest(project) == before
+    assert not (project.site / ".shipr" / "lock").exists()
+
+
+def test_park_matching_a_backup_is_removed(project):
+    project.write("a.txt", "v1")
+    project.commit()
+    run(project)
+    (project.site / "a.txt").write_text("hotfix!")  # drift: backed up by the next deploy
+    rec = run(project)
+    assert rec.uploaded[0].backup
+    p = park(project, "a.txt", "hotfix!")
+    project.write("b.txt", "b")
+    project.commit()
+    rec = run(project)
+    assert not p.exists() and rec.cleaned == [".a.txt.0123abcd.shipr-old"]
+
+
+def test_legacy_park_name_matching_manifest_is_removed(project):
+    project.write("a.txt", "v1")
+    project.commit()
+    run(project)
+    legacy = project.site / "a.txt.shipr-old"
+    legacy.write_text("v1")
+    project.write("b.txt", "b")
+    project.commit()
+    run(project)
+    assert not legacy.exists()

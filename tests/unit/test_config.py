@@ -115,3 +115,76 @@ def test_dotenv_values_are_taken_literally(tmp_path, monkeypatch):
     monkeypatch.delenv("PW", raising=False)
     raw = {"environments": {"prod": {"remote_path": "/w", "sftp": {"password": "${PW}"}}}}
     assert make(tmp_path, raw).env("prod").provider_settings["password"] == "a${B}c"
+
+
+# --- state_path overlap (C-4) -------------------------------------------------------------------
+def env_raw(remote, state=None, host="h", **extra):
+    e = {"remote_path": remote, "sftp": {"host": host}, **extra}
+    if state:
+        e["state_path"] = state
+    return e
+
+
+@pytest.mark.parametrize("remote, state", [("/var/www", "/var/www"), ("/var/www/html", "/var/www"),
+                                           ("/var/www/html", "/")])
+def test_state_path_must_not_be_remote_path_or_a_parent(tmp_path, remote, state):
+    raw = {"environments": {"prod": env_raw(remote, state)}}
+    with pytest.raises(ConfigError, match="state_path"):
+        make(tmp_path, raw).env("prod")
+
+
+@pytest.mark.parametrize("state", ["/var/www/html/.shipr", "/var/www/html/a/b", "/srv/shipr",
+                                   "/var/www/htmlstate"])
+def test_state_path_inside_or_beside_remote_path_is_fine(tmp_path, state):
+    raw = {"environments": {"prod": env_raw("/var/www/html", state)}}
+    assert make(tmp_path, raw).env("prod").effective_state_path == state
+
+
+@pytest.mark.parametrize("a, b", [
+    (env_raw("/var/www/a", "/srv/state"), env_raw("/var/www/b", "/srv/state")),  # shared
+    (env_raw("/var/www/a", "/srv/state"), env_raw("/var/www/b", "/srv/state/b")),  # nested
+    (env_raw("/var/www/html"), env_raw("/var/www/html/staging")),  # b's state in a's web root
+    (env_raw("/var/www/a", "/srv/s", host="Example.COM."), env_raw("/var/www/b", "/srv/s",
+                                                                   host="example.com")),
+])
+def test_same_server_overlapping_state_is_an_error(tmp_path, a, b):
+    cfg = make(tmp_path, {"environments": {"prod": a, "staging": b}})
+    for name in ("prod", "staging"):
+        with pytest.raises(ConfigError, match="same server"):
+            cfg.state_overlaps(name)
+
+
+def test_unknown_identity_overlap_is_a_warning(tmp_path, monkeypatch):
+    monkeypatch.delenv("STAGING_HOST", raising=False)
+    cfg = make(tmp_path, {"environments": {
+        "prod": env_raw("/var/www/html", host="a.example.com"),
+        "staging": env_raw("/var/www/html", host="b.example.com"),
+        "qa": env_raw("/var/www/html", host="${STAGING_HOST}"),  # unresolvable: still compared
+    }})
+    warnings = cfg.state_overlaps("prod")
+    assert len(warnings) == 2 and all("can't tell" in w for w in warnings)
+    assert "/var/www/html/.shipr" in warnings[0]
+
+
+def test_non_overlapping_environments_are_quiet(tmp_path):
+    cfg = make(tmp_path, {"environments": {"prod": env_raw("/var/www/html"),
+                                           "staging": env_raw("/var/www/staging")}})
+    assert cfg.state_overlaps("prod") == []
+
+
+def test_local_provider_compares_real_paths(tmp_path):
+    root = tmp_path / "srv"
+    root.mkdir()
+    local = {"provider": "local", "local": {"root": str(root)}}
+    cfg = make(tmp_path, {"environments": {
+        "a": {"remote_path": "/x", "state_path": "/s", **local},
+        "b": {"remote_path": "/y", "state_path": "/s", **local}}})
+    with pytest.raises(ConfigError, match="same server"):
+        cfg.state_overlaps("a")
+    other = tmp_path / "other"
+    other.mkdir()
+    cfg = make(tmp_path, {"environments": {
+        "a": {"remote_path": "/x", "state_path": "/s", **local},
+        "b": {"remote_path": "/y", "state_path": "/s", "provider": "local",
+              "local": {"root": str(other)}}}})
+    assert cfg.state_overlaps("a") == []

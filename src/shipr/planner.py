@@ -31,6 +31,22 @@ def safe_join(root: str, rel: str) -> str:
     return full
 
 
+_KIND_NAMES = {"symlink": "a symlink", "special": "a special file",
+               "unreadable": "an unreadable directory"}
+
+
+def blocked_reason(rel: str, opaque: dict[str, str]) -> str | None:
+    """Why shipr must not touch `rel`: it, or a directory above it, is a symlink, special file
+    or unreadable directory on the server (`opaque` maps such paths to their kind)."""
+    parts = rel.split("/")
+    for i in range(1, len(parts) + 1):
+        p = "/".join(parts[:i])
+        if p in opaque:
+            what = _KIND_NAMES.get(opaque[p], f"a {opaque[p]}")
+            return f"server path is {what}" if p == rel else f"server has {what} at {p}"
+    return None
+
+
 def stat_matches(entry: FileEntry, r: RemoteStat) -> bool:
     """Has the server file kept the size/mtime shipr recorded after uploading it?"""
     return entry.size == r.size and entry.mtime == r.mtime
@@ -51,6 +67,8 @@ class Plan:
     protected: list[str] = field(default_factory=list)
     unchanged: int = 0
     forget: list[str] = field(default_factory=list)  # manifest entries already gone remotely
+    # (path, why): at or under a server symlink/special file/unreadable dir: never touched
+    blocked: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def empty(self) -> bool:
@@ -74,10 +92,15 @@ def make_plan(
                              "exclude it or move state_path")
     plan = Plan()
     verify: list[str] = []
+    opaque = {rel: r.kind for rel, r in remote.items() if r.kind != "file"}
+    remote = {rel: r for rel, r in remote.items() if r.kind == "file"}
 
     for rel in sorted(local):
         lf, m, r = local[rel], manifest_files.get(rel), remote.get(rel)
-        if r is not None and rules.protected(rel):
+        why = blocked_reason(rel, opaque)
+        if why:
+            plan.blocked.append((rel, why))
+        elif r is not None and rules.protected(rel):
             plan.protected.append(rel)
         elif m is not None:
             if r is None:
@@ -105,7 +128,10 @@ def make_plan(
         plan.uploads.sort(key=lambda o: o.path)
 
     for rel in sorted(set(manifest_files) - set(local)):
-        if rel not in remote:
+        why = blocked_reason(rel, opaque)
+        if why:
+            plan.blocked.append((rel, why))  # kept in the manifest: not deleted, not forgotten
+        elif rel not in remote:
             plan.forget.append(rel)
         elif rules.protected(rel):
             plan.protected.append(rel)

@@ -85,3 +85,44 @@ def test_paths_are_validated_before_any_decision():
 def test_local_files_cannot_overwrite_state_dir():
     with pytest.raises(UnsafePath, match="state dir"):
         make_plan({".shipr/manifest.json": lf("a")}, {}, {}, Rules(Files()), reserved=".shipr")
+
+
+# --- remote symlinks, special files and unreadable dirs are never gone through (C-1, C-2) ------
+def opaque(kind):
+    return RemoteStat(0, 0, kind=kind)
+
+
+def test_paths_at_or_under_opaque_server_entries_are_blocked():
+    p = plan(
+        local={"storage/data.txt": lf("a"), "config.php": lf("a"), "cache/a/b.txt": lf("a"),
+               "fifo": lf("a"), "ok.txt": lf("a")},
+        manifest={"storage/old.txt": m("a"), "gone/x.txt": m("a")},
+        remote={"storage": opaque("symlink"), "config.php": opaque("symlink"),
+                "cache": opaque("unreadable"), "fifo": opaque("special"),
+                "gone": opaque("symlink")},
+        protect=["config.php"],
+    )
+    assert reasons(p) == {"ok.txt": ("new", False)}
+    assert not p.deletes and not p.forget and not p.protected
+    assert dict(p.blocked) == {
+        "cache/a/b.txt": "server has an unreadable directory at cache",
+        "config.php": "server path is a symlink",
+        "fifo": "server path is a special file",
+        "gone/x.txt": "server has a symlink at gone",
+        "storage/data.txt": "server has a symlink at storage",
+        "storage/old.txt": "server has a symlink at storage",
+    }
+
+
+def test_nested_symlink_deep_in_the_tree_blocks_only_its_subtree():
+    p = plan({"a/b/c/d.txt": lf("a"), "a/b/e.txt": lf("a")}, {},
+             {"a/b/c": opaque("symlink")})
+    assert [r for r, _ in p.blocked] == ["a/b/c/d.txt"]
+    assert reasons(p) == {"a/b/e.txt": ("new", False)}
+
+
+def test_opaque_entries_are_not_adopted_or_hashed():
+    asked = []
+    make_plan({"x": lf("a")}, {}, {"x": opaque("symlink")}, Rules(Files()),
+              lambda rels: asked.extend(rels) or {})
+    assert asked == []
