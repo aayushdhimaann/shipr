@@ -161,13 +161,15 @@ build:
   commands: []                   # shell commands, run in order inside the exported commit
   output: .                      # folder (relative to source) whose contents are uploaded
   env: null                      # list of variable names local commands may see (plus PATH,
-                                 # HOME and other basics); null = all of them (see "Secrets")
+                                 # HOME and other basics); null = all of them, with a warning
+                                 # (see "Secrets")
 
 files:
   include: ["**"]                # gitignore-style patterns, relative to the output folder
   exclude: []                    # added to the built-in excludes (see below)
   protect: []                    # never overwritten or deleted once they exist on the server
-  default_excludes: true         # false disables the built-in excludes (careful!)
+  default_excludes: true         # false disables the built-in excludes (careful! warns and
+                                 # lists the files they would have kept back)
 
 hooks:
   local_before: []               # run locally before the build (also during --dry-run)
@@ -219,7 +221,8 @@ environments:
 
 ### Built-in excludes
 
-These are never uploaded unless you set `default_excludes: false`:
+These are never uploaded unless you set `default_excludes: false`. With it, `shipr validate` and
+every deploy warn and list the files these patterns would have kept back (names only):
 
 ```
 .git/  .shipr/  .env  .env.*  *.pem  *.key  id_rsa*  id_ed25519*  shipr.yml
@@ -244,7 +247,13 @@ secret never shows up in output or in deploy history. Inside a command, use shel
   every package an `npm ci` or `composer install` runs could read them. To limit this, list
   the variables commands need in `build.env`, for example `env: [NODE_ENV, VITE_API_URL]`.
   Commands then get only those, a few basics (`PATH`, `HOME`, locale, temp dirs and the Windows
-  system variables) and the `SHIPR_*` variables above.
+  system variables) and the `SHIPR_*` variables above. Without `build.env`, `shipr validate`
+  and every deploy warn, naming the variables that feed your provider settings (never their
+  values). An ssh-agent socket (`SSH_AUTH_SOCK`) is part of your environment too, and
+  `build.env` keeps it out.
+- **Planned for the next major release:** variables that supply provider settings (such as
+  `password: ${SHIPR_PASSWORD}`) will be hidden from local commands unless `build.env` names
+  them. Set `build.env` now to get that behaviour today.
 - **Remote commands** (`remote_*`) run with the server's own environment.
 
 ### Recipes by project type
@@ -324,8 +333,10 @@ Writes a commented `shipr.yml` in the current folder. It looks at `package.json`
 | `--force` | Overwrite an existing `shipr.yml` |
 
 ### `shipr validate`
-Loads and checks the configuration of every environment: unknown keys, invalid paths and missing
-`${VARIABLES}`. It does not connect to anything.
+Loads and checks the configuration of every environment: unknown or duplicate keys, invalid
+paths, missing `${VARIABLES}` and the provider's own settings (for SFTP: misspelled keys, missing
+`host` or `username`, malformed `host_key`). It also warns about build commands that can read
+deploy credentials and about `default_excludes: false`. It does not connect to anything.
 
 ### `shipr test -e ENV`
 Connects to the server and reports:
@@ -543,6 +554,9 @@ Details are in [docs/security.md](docs/security.md).
 | `HOST KEY MISMATCH` | The server key changed, or doesn't match your `host_key` pin. Confirm with your host why. Then update the pin, or remove the old line from `known_hosts` (see "Rotating the server's key"). |
 | `authentication failed` | Check `username`, and the password or key. Check the `${VARIABLE}` is set (`shipr validate`). |
 | `could not connect` | Check the host and port and your firewall. Raise `timeout` or `retries` for slow links. |
+| `invalid YAML at line N ...: duplicate key` | The same key is given twice in one mapping; YAML would silently keep the last one. Remove one. |
+| `invalid sftp settings` | The message names the setting: a typo (`hots`), a missing `host` or `username`, or a malformed `host_key`. |
+| `build commands and local hooks see your whole environment` | Add `build.env` listing the variables your build needs (`env: []` if none). |
 | `remote_path ... must be a normalised absolute directory` | Use a full path like `/home/u123/public_html`. `shipr test` prints your login directory. |
 | `could not tell whether ... allows shell commands` | The shell check timed out or the connection dropped, so shipr can't tell whether your remote hooks would run. It stops before changing anything instead of skipping them. Deploy again. If the server really has no shell, set `ssh_exec: false`. |
 | `server has no shell access; ... hooks skipped` | Expected on SFTP-only hosting. Set `ssh_exec: false` to skip the probe, or move the commands into `build.commands`. |

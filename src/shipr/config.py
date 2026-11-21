@@ -13,8 +13,9 @@ import yaml
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from .errors import ConfigError
+from .errors import ConfigError, ProviderError
 from .paths import app_dir
+from .providers import get as get_provider
 from .providers import provider_names
 from .providers.base import is_within
 
@@ -152,8 +153,8 @@ class Config:
         if not self.environments:
             raise ConfigError(f"{path}: no environments defined")
 
-    def env(self, name: str, interpolate: bool = True) -> Environment:
-        """Effective, validated settings for one environment."""
+    def _merged(self, name: str) -> dict[str, Any]:
+        """The environment's layers merged, before interpolation."""
         if name not in self.environments:
             raise ConfigError(
                 f"unknown environment {name!r} (have: {', '.join(self.environments)})"
@@ -165,6 +166,23 @@ class Config:
                              ("defaults", self.raw.get("defaults")),
                              (f"environments.{name}", self.environments[name])):
             merged = deep_merge(merged, _mapping(self.path, where, layer))
+        return merged
+
+    def credential_variables(self, name: str) -> dict[str, list[str]]:
+        """${VARIABLES} that supply the environment's provider settings (its credentials among
+        them), each with the settings it feeds, e.g. {"PW": ["sftp.password"]}. Read from the
+        merged config before interpolation, so they are found whether or not they are set."""
+        merged = self._merged(name)
+        provider = str(merged.get("provider") or Environment.model_fields["provider"].default)
+        found: dict[str, list[str]] = {}
+        for var, where in _references(merged.get(provider), provider):
+            found.setdefault(var, []).append(where)
+        return found
+
+    def env(self, name: str, interpolate: bool = True) -> Environment:
+        """Effective, validated settings for one environment. Provider settings are checked
+        by the provider when `interpolate` (raw ${VARS} can't be)."""
+        merged = self._merged(name)
         merged["name"] = name
         # checked before the commands split below, which reaches into build as a dict
         _mapping(self.path, f"environment {name!r}: build", merged.get("build"))
@@ -187,6 +205,13 @@ class Config:
             raise ConfigError(f"environment {name!r}: unknown keys: {', '.join(sorted(bad))}")
         if env.provider not in provider_names():
             raise ConfigError(f"environment {name!r}: unknown provider {env.provider!r}")
+        # optional: providers written before validate_settings existed don't have it
+        check = getattr(get_provider(env.provider), "validate_settings", None)
+        if interpolate and check:
+            try:
+                check(env.provider_settings)
+            except ProviderError as e:
+                raise ConfigError(f"{self.path}: environment {name!r}: {e}") from None
         return env
 
     def state_overlaps(self, name: str) -> list[str]:
@@ -306,6 +331,15 @@ def _mapping(path: Path, where: str, value: Any) -> dict[str, Any]:
     return value
 
 
+def _references(value: Any, where: str) -> list[tuple[str, str]]:
+    """(variable, setting) for every ${VAR} in `value`, however deeply nested."""
+    if isinstance(value, dict):
+        return [r for k, v in value.items() for r in _references(v, f"{where}.{k}")]
+    if isinstance(value, list):
+        return [r for i, v in enumerate(value) for r in _references(v, f"{where}[{i}]")]
+    return [(var, where) for var in _VAR.findall(value)] if isinstance(value, str) else []
+
+
 def _interpolate(value: Any, variables: dict[str, str]) -> Any:
     if isinstance(value, dict):
         return {k: _interpolate(v, variables) for k, v in value.items()}
@@ -328,11 +362,37 @@ def find_config(start: Path) -> Path:
     raise ConfigError(f"no {CONFIG_NAME} found in {start} or its parents (run `shipr init`)")
 
 
+class _StrictLoader(yaml.SafeLoader):
+    """safe_load that rejects a key given twice in one mapping (YAML would keep the last one
+    silently). Keys brought in by a `<<: *anchor` merge may still be overridden."""
+
+    def compose_mapping_node(self, anchor):  # type: ignore[no-untyped-def]
+        node = super().compose_mapping_node(anchor)
+        seen: dict[Any, int] = {}
+        for key_node, _ in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge" or \
+                    not isinstance(key_node, yaml.ScalarNode):
+                continue
+            key, line = self.construct_object(key_node), key_node.start_mark.line + 1
+            if key in seen:
+                raise yaml.MarkedYAMLError(
+                    problem=f"duplicate key {key!r} (first given on line {seen[key]}); YAML "
+                    "would silently keep only the last value", problem_mark=key_node.start_mark)
+            seen[key] = line
+        return node
+
+
 def _read_yaml(path: Path) -> dict[str, Any]:
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        data = yaml.load(path.read_text(encoding="utf-8"), Loader=_StrictLoader) or {}
+    except yaml.MarkedYAMLError as e:
+        # not str(e): PyYAML quotes the offending line, which may hold a password
+        mark = e.problem_mark or e.context_mark
+        where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        problem = e.problem or e.context or "syntax error"
+        raise ConfigError(f"{path}: invalid YAML{where}: {problem}") from None
     except yaml.YAMLError as e:
-        raise ConfigError(f"{path}: invalid YAML: {e}") from None
+        raise ConfigError(f"{path}: invalid YAML: {type(e).__name__}") from None
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: expected a mapping at top level")
     return data

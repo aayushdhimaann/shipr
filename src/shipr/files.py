@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,6 +18,12 @@ DEFAULT_EXCLUDES = [
     "shipr.yml", "node_modules/", ".DS_Store", "Thumbs.db", "*.log", "*.shipr-tmp",
     "*.shipr-old",
 ]
+_DEFAULTS = GitIgnoreSpec.from_lines(DEFAULT_EXCLUDES)
+
+
+def default_excluded(paths: Iterable[str]) -> list[str]:
+    """The paths the built-in excludes would keep off the server (names only, sorted)."""
+    return sorted(p for p in paths if _DEFAULTS.match_file(p))
 
 
 @dataclass(frozen=True)

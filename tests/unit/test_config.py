@@ -9,6 +9,7 @@ def make(tmp_path, raw, global_raw=None):
     return Config(p, raw, global_raw)
 
 
+SFTP = {"host": "h", "username": "u"}  # the least valid sftp settings
 BASE = {"environments": {"prod": {"remote_path": "/var/www", "sftp": {"host": "h"}}}}
 
 
@@ -104,7 +105,7 @@ def test_commands_are_not_interpolated(tmp_path, monkeypatch):
     monkeypatch.setenv("TOKEN", "s3cret")
     raw = {"build": {"commands": ["curl -H ${TOKEN}"]},
            "hooks": {"remote_after": ["echo ${TOKEN}"]},
-           "environments": {"prod": {"remote_path": "/w"}}}
+           "environments": {"prod": {"remote_path": "/w", "sftp": SFTP}}}
     env = make(tmp_path, raw).env("prod")
     assert env.build.commands == ["curl -H ${TOKEN}"]
     assert env.hooks.remote_after == ["echo ${TOKEN}"]
@@ -113,13 +114,14 @@ def test_commands_are_not_interpolated(tmp_path, monkeypatch):
 def test_dotenv_values_are_taken_literally(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text("PW='a${B}c'\n")
     monkeypatch.delenv("PW", raising=False)
-    raw = {"environments": {"prod": {"remote_path": "/w", "sftp": {"password": "${PW}"}}}}
+    raw = {"environments": {"prod": {"remote_path": "/w",
+                                     "sftp": {**SFTP, "password": "${PW}"}}}}
     assert make(tmp_path, raw).env("prod").provider_settings["password"] == "a${B}c"
 
 
 # --- state_path overlap (C-4) -------------------------------------------------------------------
 def env_raw(remote, state=None, host="h", **extra):
-    e = {"remote_path": remote, "sftp": {"host": host}, **extra}
+    e = {"remote_path": remote, "sftp": {"host": host, "username": "u"}, **extra}
     if state:
         e["state_path"] = state
     return e
@@ -199,7 +201,7 @@ def test_default_state_dir_is_beside_the_web_root(tmp_path, remote, state):
 
 
 def test_hook_timeout_defaults_to_30_minutes_and_can_be_disabled(tmp_path):
-    raw = {"environments": {"prod": {"remote_path": "/w"}}}
+    raw = {"environments": {"prod": {"remote_path": "/w", "sftp": SFTP}}}
     assert make(tmp_path, raw).env("prod").hooks.timeout == 1800
     raw["hooks"] = {"timeout": None}
     assert make(tmp_path, raw).env("prod").hooks.timeout is None

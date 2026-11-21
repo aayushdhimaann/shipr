@@ -9,7 +9,7 @@ from pathlib import Path
 
 import click
 
-from . import __version__, admin, config, engine, gitops, scaffold
+from . import __version__, admin, config, engine, gitops, scaffold, workspace
 from .errors import GitError, ShiprError
 from .models import DeployRecord
 from .ui import UI
@@ -122,6 +122,15 @@ def validate(obj: Ctx) -> None:
         env = cfg.env(name)
         warnings += [w for w in cfg.state_overlaps(name) if w not in warnings]
         click.echo(f"{name}: ok ({env.provider} → {env.remote_path})")
+        if w := workspace.credential_warning(cfg, env):
+            warnings.append(f"{name}: {w}")
+        if not env.files.default_excludes:
+            found = workspace.committed_default_excluded(cfg, env)
+            built = found is not None and env.build.commands
+            warnings.append(f"{name}: " + workspace.default_excludes_warning(
+                found, f"committed at {env.branch or 'HEAD'}") + (
+                " (files your build creates are listed when you deploy; try --dry-run)"
+                if built else ""))
     for w in warnings:
         click.echo(f"warning: {w}")
 

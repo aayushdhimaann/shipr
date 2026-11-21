@@ -53,6 +53,13 @@ class Provider(ABC):
         # with trust_new_host, asked before trusting an unknown server key (host, key) -> yes?
         self.confirm_host_key: Callable[[str, str], bool] | None = None
 
+    @classmethod
+    def validate_settings(cls, settings: dict[str, Any]) -> None:
+        """Override to check this provider's settings without connecting (`shipr validate` and
+        every command call it). Raise ProviderError naming the problem, never a setting's
+        value: it may be a password. Optional: the default accepts anything."""
+        return None
+
     # lifecycle -----------------------------------------------------------
     @abstractmethod
     def connect(self) -> None: ...

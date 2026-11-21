@@ -103,7 +103,32 @@
 - `ssh_exec: false` now says it skipped hooks deliberately, instead of "no shell access".
 - New optional `Provider.exec_probe_error()` for providers that probe shell support.
 
+### Configuration and secret hygiene (Phase 3D)
+
+- A key given twice in one mapping of `shipr.yml` or the global config is now an error naming
+  both lines. YAML used to keep the last value silently, so a second `production:` could
+  redirect a deploy. Overriding a value brought in by a `<<: *anchor` merge is still allowed.
+- Invalid YAML errors no longer quote the offending line, which could hold a password. They give
+  the line and column instead.
+- Provider settings are checked by `shipr validate` (and every command), not only when
+  connecting: misspelled keys, missing `host` or `username`, malformed `host_key` pins, and
+  out-of-range `port`, `timeout` or `retries`. Errors name the setting, never its value.
+- New optional `Provider.validate_settings(settings)` classmethod for third-party providers.
+  Providers without it keep working.
+- Build commands and local hooks without a `build.env` allowlist now get a warning, in
+  `shipr validate` and on each deploy, naming the variables that supply provider settings (for
+  example `SHIPR_PASSWORD (sftp.password)`), never their values. Nothing is hidden from the
+  commands yet. **Planned for the next major release:** variables that supply provider settings
+  will be hidden from local commands by default, unless `build.env` names them.
+- `files.default_excludes: false` now warns in `shipr validate` (listing the matching committed
+  files) and on each deploy (listing the files in that deploy, such as `.env`, that the built-in
+  excludes would have kept back). File names only; what gets uploaded is unchanged.
+
 ### Breaking changes
+
+- **`shipr validate` and every command now reject invalid provider settings and duplicate YAML
+  keys** that used to load. Such configs failed on connect (provider settings) or silently used
+  the last value (duplicate keys). Fix the setting the error names.
 
 - **An unclear shell check with remote hooks configured now stops the deploy** instead of
   skipping the hooks. Set `ssh_exec: false` if the server has no shell and the hooks should be

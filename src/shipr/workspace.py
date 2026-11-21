@@ -4,6 +4,7 @@ select and fingerprint the output. Nothing here touches the server."""
 from __future__ import annotations
 
 import os
+import posixpath
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -13,7 +14,7 @@ from pathlib import Path
 from . import gitops
 from .config import Config, Environment
 from .errors import DeployError, GitError
-from .files import LocalFile, Rules, collect
+from .files import LocalFile, Rules, collect, default_excluded
 from .hooks import run_local
 from .ui import UI
 
@@ -80,6 +81,8 @@ def _build(cfg: Config, env: Environment, ref: str | None, ui: UI, tmp: Path) ->
     project_dir = _inside(export_root, export_root / rel_project / env.source,
                           f"source directory {env.source!r} not found in {sha[:7]}")
     hook_env = command_env(cfg, env, sha)
+    if warning := credential_warning(cfg, env):
+        ui.warn(warning)
     run_local(env.hooks.local_before, project_dir, hook_env, ui, timeout=env.hooks.timeout)
     run_local(env.build.commands, project_dir, hook_env, ui)
     out_dir = _inside(export_root, project_dir / env.build.output,
@@ -87,6 +90,8 @@ def _build(cfg: Config, env: Environment, ref: str | None, ui: UI, tmp: Path) ->
 
     rules = Rules(env.files)
     files = collect(out_dir, rules, warn=ui.warn)
+    if not env.files.default_excludes:
+        ui.warn(default_excludes_warning(default_excluded(files), "in this deploy"))
     ui.echo(f"{len(files)} deployable files")
     return Workspace(repo=repo, sha=sha, branch=branch, subject=subject,
                      project_dir=project_dir,
@@ -113,6 +118,54 @@ def command_env(cfg: Config, env: Environment, sha: str) -> dict[str, str]:
                      if k.upper() in allowed or k.upper().startswith("LC_")}
     return {**variables, "SHIPR_ENV": env.name, "SHIPR_COMMIT": sha,
             "SHIPR_PROJECT": cfg.project_name}
+
+
+def credential_warning(cfg: Config, env: Environment) -> str | None:
+    """C-14: local commands without a `build.env` allowlist see every variable, including
+    the ones that supply the provider's credentials. Names them, never their values."""
+    if env.build.env is not None or not (
+            env.build.commands or env.hooks.local_before or env.hooks.local_after):
+        return None
+    found = cfg.credential_variables(env.name)
+    listed = ", ".join(f"{var} ({', '.join(where)})" for var, where in found.items())
+    named = (f", including {listed}, which supply your {env.provider} settings" if found
+             else ", including any deploy credentials in them")
+    return (f"build commands and local hooks see your whole environment and .env{named}. A "
+            "compromised build tool or dependency could read them. List the variables the "
+            "commands need in `build.env` (an empty list is fine). In the next major release, "
+            "variables that supply provider settings will be hidden from local commands unless "
+            "`build.env` names them.")
+
+
+def default_excludes_warning(paths: list[str] | None, where: str) -> str:
+    """C-18: what `default_excludes: false` lets through (file names only, never contents).
+    `paths` None: the files aren't known."""
+    off = ("default_excludes is false, so the built-in excludes (.env files, private keys, "
+           ".git/, shipr.yml, logs ...) are off")
+    if paths is None:
+        return f"{off}; `shipr deploy --dry-run` lists the files they would have kept back"
+    if not paths:
+        return f"{off}; none of the files {where} match them"
+    shown = ", ".join(paths[:20]) + (f" and {len(paths) - 20} more" if len(paths) > 20 else "")
+    return (f"{off}. These files {where} would otherwise be kept off the server and will be "
+            f"uploaded: {shown}. Exclude them in files.exclude unless they must be uploaded.")
+
+
+def committed_default_excluded(cfg: Config, env: Environment) -> list[str] | None:
+    """For `shipr validate`: committed files in the environment's deploy folder that the
+    built-in excludes would have kept back. None if git can't tell (build output is only
+    known when deploying)."""
+    try:
+        repo, sha, _ = resolve_target(cfg, env, None)
+        names = gitops.git("ls-tree", "-r", "-z", "--full-tree", "--name-only", sha, cwd=repo)
+    except (GitError, DeployError):
+        return None
+    folder = posixpath.normpath((Path(os.path.relpath(cfg.dir.resolve(), repo.resolve()))
+                                 / env.source / env.build.output).as_posix())
+    prefix = "" if folder == "." else folder + "/"
+    rules = Rules(env.files)
+    rels = [n[len(prefix):] for n in names.split("\0") if n.startswith(prefix)]
+    return default_excluded(r for r in rels if r and rules.wanted(r))
 
 
 def _inside(root: Path, path: Path, missing_msg: str) -> Path:

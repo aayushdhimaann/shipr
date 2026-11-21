@@ -75,3 +75,35 @@ def test_host_key_trust_is_never_assumed_without_a_terminal():
 
     ui = make_ui()  # CliRunner/pytest stdin is not a TTY
     assert ui.trust_host("h", "ssh-ed25519 SHA256:x") is False
+
+
+def test_validate_warns_about_build_credentials_and_default_excludes(project, monkeypatch):
+    monkeypatch.chdir(project.repo)
+    project.write_config("build:\n  commands: [make]\nfiles:\n  default_excludes: false\n")
+    project.write(".env", "DB_PASSWORD=hunter2-cli\n")
+    project.write("index.php", "x")
+    project.commit()
+    r = CliRunner().invoke(cli, ["validate"])
+    assert r.exit_code == 0, r.output
+    assert "build.env" in r.output and "next major" in r.output
+    assert "default_excludes is false" in r.output and ".env, shipr.yml" in r.output
+    assert "hunter2-cli" not in r.output
+    (project.repo / ".git").rename(project.repo / "git-off")  # git can't list the files
+    r = CliRunner().invoke(cli, ["validate"])
+    assert r.exit_code == 0 and "default_excludes is false" in r.output, r.output
+    assert "--dry-run" in r.output and "hunter2-cli" not in r.output
+
+
+def test_validate_catches_provider_settings_and_duplicate_keys(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SHIPR_T_PW", "hunter2-cli")
+    cfg = tmp_path / "shipr.yml"
+    cfg.write_text("version: 1\nenvironments:\n  prod:\n    remote_path: /w\n"
+                   "    sftp: {hots: h, username: u, password: '${SHIPR_T_PW}'}\n")
+    r = CliRunner().invoke(cli, ["validate"])
+    assert r.exit_code == 1 and "hots" in r.output and "Traceback" not in r.output, r.output
+    assert "hunter2-cli" not in r.output
+    cfg.write_text("version: 1\nenvironments:\n  prod:\n    remote_path: /w\n"
+                   "    sftp: {host: h, username: u, password: x, password: y}\n")
+    r = CliRunner().invoke(cli, ["validate"])
+    assert r.exit_code == 1 and "duplicate key 'password'" in r.output and "line 5" in r.output

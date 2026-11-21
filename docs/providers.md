@@ -67,8 +67,12 @@ environments:
     ftp: {host: example.com, username: me, password: "${FTP_PASSWORD}"}
 ```
 
-Your provider receives the `ftp:` mapping as `self.settings`. Validate it in `__init__`; using a
-pydantic model with `hide_input_in_errors=True` keeps passwords out of error messages.
+Your provider receives the `ftp:` mapping as `self.settings`. To have `shipr validate` check it
+without connecting, override the optional classmethod `validate_settings(settings)` and raise
+`ProviderError` naming the problem. Never include a setting's value: it may be a password. A
+pydantic model with `hide_input_in_errors=True` does this for you (see `SFTPProvider`).
+Providers without `validate_settings` keep working; their settings are checked when they
+connect.
 
 ## Testing
 

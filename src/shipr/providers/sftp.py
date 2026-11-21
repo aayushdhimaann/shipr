@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 import paramiko
-from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 
 from ..errors import (
     AmbiguousOperation,
@@ -49,13 +49,13 @@ class SFTPSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     host: str
-    port: int = 22
+    port: int = Field(22, ge=1, le=65535)
     username: str
     password: SecretStr | None = None  # SecretStr: never shown by repr() or tracebacks
     key_file: str | None = None
     passphrase: SecretStr | None = None
-    timeout: float = 15
-    retries: int = 3
+    timeout: float = Field(15, gt=0)
+    retries: int = Field(3, ge=0)
     known_hosts: str | None = None
     # pinned server key fingerprint(s), as `ssh-keygen -lf` prints them; a list while rotating
     host_key: list[str] | None = None
@@ -208,16 +208,24 @@ class SFTPProvider(Provider):
 
     def __init__(self, settings: dict[str, Any], trust_new_host: bool = False):
         super().__init__(settings, trust_new_host)
-        try:
-            self.cfg = SFTPSettings.model_validate(settings)
-        except ValidationError as e:
-            raise ProviderError(f"invalid sftp settings:\n{e}") from None
+        self.cfg = self._parse(settings)
         self.client: paramiko.SSHClient | None = None
         self._sftp: paramiko.SFTPClient | None = None
         self._exec_ok: bool | None = None
         self.host_fingerprint = ""
         self._reconnected = False  # set by _retry: an earlier attempt of this op may have run
         self._exec_problem: str | None = None  # why the shell probe gave no clear answer
+
+    @staticmethod
+    def _parse(settings: dict[str, Any]) -> SFTPSettings:
+        try:
+            return SFTPSettings.model_validate(settings)
+        except ValidationError as e:  # hide_input_in_errors: names settings, never values
+            raise ProviderError(f"invalid sftp settings:\n{e}") from None
+
+    @classmethod
+    def validate_settings(cls, settings: dict[str, Any]) -> None:
+        cls._parse(settings)
 
     # connection ------------------------------------------------------------
     def connect(self) -> None:

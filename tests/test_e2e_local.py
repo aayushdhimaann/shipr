@@ -992,3 +992,49 @@ def test_kept_deletions_still_finish_pending_hooks_and_interrupted_deploys(proje
     (project.state / "manifest.json").write_text(json.dumps(m))
     rec = run(project, no_delete=True)
     assert rec.status == "success" and "in_progress" not in manifest(project)
+
+
+# --- configuration and secret hygiene (Phase 3D: C-14, C-18) -------------------------------------
+def test_build_without_allowlist_warns_by_name_and_keeps_behaviour(project, monkeypatch):
+    monkeypatch.setenv("SHIPR_T_ROOT", project.server.as_posix())
+    (project.repo / "dump.py").write_text(
+        "import json, os\nos.makedirs('out', exist_ok=True)\n"
+        "json.dump(sorted(os.environ), open('out/env.json', 'w'))\n")
+    (project.repo / "shipr.yml").write_text(
+        "version: 1\nproject: {name: demo}\n"
+        f"build:\n  commands: ['\"{PY}\" dump.py']\n  output: out\n"
+        "defaults:\n  provider: local\n  local: {root: '${SHIPR_T_ROOT}'}\n"
+        "environments:\n  prod:\n    remote_path: /site\n")
+    (project.repo / ".env").write_text("DB_PASSWORD=hunter2-e2e\n")
+    project.commit()
+    for dry_run in (True, False):
+        ui = RecordingUI()
+        run(project, ui=ui, dry_run=dry_run)
+        assert "SHIPR_T_ROOT (local.root)" in ui.text and "build.env" in ui.text, ui.text
+        assert "hunter2-e2e" not in ui.text and project.server.as_posix() not in ui.text
+    seen = set(json.loads((project.site / "env.json").read_text()))
+    assert {"SHIPR_T_ROOT", "DB_PASSWORD"} <= seen  # nothing stripped in this release
+
+
+def test_default_excludes_off_warns_with_the_files_and_still_uploads(project):
+    project.write_config("files:\n  default_excludes: false\n")
+    project.write("index.php", "x")
+    project.write(".env", "DB_PASSWORD=hunter2-e2e\n")
+    project.write("certs/site.key", "PRIVATE-KEY-BYTES")
+    project.commit()
+    ui = RecordingUI()
+    run(project, ui=ui)
+    assert "default_excludes is false" in ui.text
+    assert ".env, certs/site.key, shipr.yml" in ui.text, ui.text
+    assert "hunter2-e2e" not in ui.text and "PRIVATE-KEY-BYTES" not in ui.text
+    assert {".env", "certs/site.key", "shipr.yml"} <= project.remote_files()  # unchanged
+
+
+def test_default_excludes_on_is_quiet(project):
+    project.write("index.php", "x")
+    project.write(".env", "DB_PASSWORD=hunter2-e2e\n")
+    project.commit()
+    ui = RecordingUI()
+    run(project, ui=ui)
+    assert "default_excludes" not in ui.text and "build.env" not in ui.text
+    assert ".env" not in project.remote_files()
