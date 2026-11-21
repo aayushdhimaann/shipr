@@ -28,6 +28,7 @@ from ..errors import (
     AmbiguousOperation,
     CommandTimeout,
     ConnectionLost,
+    ExecNotSupported,
     ProviderError,
     UnsafePath,
 )
@@ -38,6 +39,10 @@ T = TypeVar("T")
 TRANSIENT = (paramiko.SSHException, EOFError, socket.timeout, ConnectionError)
 SHA256_BATCH = 200
 SHA256_TIMEOUT = 300  # seconds per batch; on timeout those files are hashed by downloading
+PROBE_COMMAND = "echo shipr-ok"
+# what servers that refuse shell commands answer: OpenSSH's `ForceCommand internal-sftp`
+# (verified against the atmoz/sftp image) and a nologin shell
+REFUSALS = ("this service allows sftp connections only", "this account is currently not available")
 
 
 class SFTPSettings(BaseModel):
@@ -212,6 +217,7 @@ class SFTPProvider(Provider):
         self._exec_ok: bool | None = None
         self.host_fingerprint = ""
         self._reconnected = False  # set by _retry: an earlier attempt of this op may have run
+        self._exec_problem: str | None = None  # why the shell probe gave no clear answer
 
     # connection ------------------------------------------------------------
     def connect(self) -> None:
@@ -544,14 +550,31 @@ class SFTPProvider(Provider):
 
     # commands --------------------------------------------------------------
     def supports_exec(self) -> bool:
+        """Probe once per connection. False both when the server explicitly refuses shell
+        commands and when the probe gave no clear answer; exec_probe_error() tells them apart."""
         if self._exec_ok is None:
-            try:
-                # timeout: on SFTP-only servers the probe can hang instead of failing
-                code, out, _ = self.exec("echo shipr-ok", timeout=self.cfg.timeout)
-                self._exec_ok = code == 0 and "shipr-ok" in out
-            except Exception:
-                self._exec_ok = False
+            self._exec_ok, self._exec_problem = self._probe_exec()
         return self._exec_ok
+
+    def exec_probe_error(self) -> str | None:
+        self.supports_exec()
+        return self._exec_problem
+
+    def _probe_exec(self) -> tuple[bool, str | None]:
+        """(works, why it's unknown). Only a recognisable refusal counts as "no shell": a
+        timeout or a dropped connection says nothing about the server's policy."""
+        try:
+            code, out, _ = self.exec(PROBE_COMMAND, timeout=self.cfg.timeout)
+        except ExecNotSupported:
+            return False, None
+        except (CommandTimeout, ProviderError) as e:
+            return False, str(e)
+        if code == 0 and "shipr-ok" in out:
+            return True, None
+        if any(refusal in out.lower() for refusal in REFUSALS):
+            return False, None
+        return False, (f"`{PROBE_COMMAND}` exited {code} with unexpected output "
+                       f"{out.strip()[:200]!r}")
 
     def exec(self, command: str, cwd: str | None = None, timeout: float | None = None,
              on_output: Callable[[str], None] | None = None) -> tuple[int, str, str]:
@@ -583,6 +606,11 @@ class SFTPProvider(Provider):
                 return chan.recv_exit_status(), out, ""
             finally:
                 chan.close()
+        except paramiko.ChannelException as e:
+            if e.code == paramiko.common.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED:
+                raise ExecNotSupported(f"{self.describe()} refuses shell sessions") from None
+            raise ProviderError(f"could not run remote command on {self.describe()}: "
+                                f"{e} ({command})") from None
         except (paramiko.SSHException, OSError, EOFError) as e:
             raise ProviderError(f"could not run remote command on {self.describe()}: "
                                 f"{e or type(e).__name__} ({command})") from None

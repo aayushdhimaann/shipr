@@ -88,8 +88,26 @@
 - `sha256sum` batches time out after 300 seconds and fall back to downloading.
 - `Provider.exec` accepts an optional `on_output` callback. Providers without it keep working.
 
+### Hook scheduling and shell detection (Phase 3C)
+
+- A deploy whose only pending change was files kept by `--no-delete` (or a declined deletion
+  prompt) re-ran every remote hook and wrote a new history record each time. It is now "up to
+  date": no hooks run and no records are written. The kept files are still listed, and a later
+  deploy with deletion confirmed removes them.
+- With `ssh_exec: auto`, a shell check that timed out or lost its connection was taken to mean
+  "SFTP-only server", so remote hooks such as migrations were silently skipped and the deploy
+  reported success. Now only an explicit refusal counts as "no shell": OpenSSH's "This service
+  allows sftp connections only.", a nologin shell, or an administratively refused session.
+  Anything else stops the deploy before any change, when remote hooks are configured.
+- The shell check runs before any prompt or change, not after the confirmation.
+- `ssh_exec: false` now says it skipped hooks deliberately, instead of "no shell access".
+- New optional `Provider.exec_probe_error()` for providers that probe shell support.
+
 ### Breaking changes
 
+- **An unclear shell check with remote hooks configured now stops the deploy** instead of
+  skipping the hooks. Set `ssh_exec: false` if the server has no shell and the hooks should be
+  skipped.
 - **Hooks now have a 30-minute default timeout.** Set `hooks.timeout: null` for hooks that
   legitimately run longer.
 - **`local_before`, `local_after` and `local`-provider hooks no longer read from your

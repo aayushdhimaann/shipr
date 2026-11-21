@@ -588,3 +588,67 @@ def test_sha256sum_timeout_falls_back_to_downloading(project, ssh_server, tmp_pa
         got = p.sha256([f"{remote}/f.txt"])
     assert got == {f"{remote}/f.txt": hashlib.sha256(b"hash me").hexdigest()}
     assert downloads == [f"{remote}/f.txt"]
+
+
+# --- shell capability probe (Phase 3C: audit C-13) ----------------------------------------------
+def nothing_deployed(project, remote):
+    import posixpath
+
+    parent, name = posixpath.split(remote)
+    with provider(project) as p:
+        return p.walk(remote) == {} and p.stat(f"{parent}/.shipr/{name}/manifest.json") is None
+
+
+def test_sftp_only_server_is_an_explicit_refusal(project, sftp_only_server):
+    configure(project, sftp_only_server, f"      password: {PASSWORD}\n")
+    with provider(project) as p:
+        assert p.supports_exec() is False and p.exec_probe_error() is None
+
+
+def test_probe_timeout_stops_before_any_change(project, ssh_server, monkeypatch):
+    from shipr.errors import DeployError
+    from shipr.providers import sftp as sftp_mod
+
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n",
+                       top="hooks:\n  remote_after: ['php artisan migrate']\n")
+    project.write("a.txt", "a")
+    project.commit()
+    monkeypatch.setattr(sftp_mod, "PROBE_COMMAND", "sleep 30; echo shipr-ok")  # timeout: 5
+    with pytest.raises(DeployError, match="could not tell whether"):
+        deploy(project)
+    assert nothing_deployed(project, remote)
+
+
+def test_connection_failure_during_probe_stops_before_any_change(project, ssh_server,
+                                                                 monkeypatch):
+    from shipr.errors import DeployError
+
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n",
+                       top="hooks:\n  remote_after: ['echo migrated > hook.txt']\n")
+    project.write("a.txt", "a")
+    project.commit()
+    real = SFTPProvider.supports_exec
+
+    def drop_then_probe(self):
+        self.client.get_transport().close()  # the network blips exactly during the probe
+        return real(self)
+    monkeypatch.setattr(SFTPProvider, "supports_exec", drop_then_probe)
+    with pytest.raises(DeployError, match="could not tell whether"):
+        deploy(project)
+    monkeypatch.undo()
+    assert nothing_deployed(project, remote)
+    assert deploy(project).status == "success"  # a working probe: the deploy goes ahead
+
+
+def test_ssh_exec_false_skips_hooks_deliberately(project, ssh_server):
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n",
+                       extra_env="    ssh_exec: false\n",
+                       top="hooks:\n  remote_after: ['echo ran > hook.txt']\n")
+    project.write("a.txt", "a")
+    project.commit()
+    ui = RecordingUI()
+    rec = deploy(project, ui=ui)
+    assert rec.status == "success" and rec.hooks == "skipped"
+    assert "ssh_exec is false" in ui.text
+    with provider(project) as p:
+        assert p.stat(f"{remote}/hook.txt") is None

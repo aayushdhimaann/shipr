@@ -108,6 +108,12 @@ class Provider(ABC):
         """Override: can this target run shell commands? (may probe and cache)"""
         return False
 
+    def exec_probe_error(self) -> str | None:
+        """Override if supports_exec() probes: why the probe gave no clear answer (a timeout,
+        a dropped connection), or None when False means the target really can't run commands.
+        With hooks configured and `ssh_exec: auto`, an unclear answer stops the deploy."""
+        return None
+
     def exec(self, command: str, cwd: str | None = None, timeout: float | None = None,
              on_output: Callable[[str], None] | None = None) -> tuple[int, str, str]:
         """Run a shell command on the target; returns (exit code, stdout, stderr).

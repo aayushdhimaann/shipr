@@ -205,8 +205,15 @@ environments:
 
 - If there is no `password`, shipr also tries your ssh-agent. You can leave out both `password`
   and `key_file` and rely on the agent alone.
-- For a server with SFTP only (no shell), set `ssh_exec: false`. Otherwise shipr probes for a
-  shell, which can take up to `timeout` seconds on such servers.
+- `ssh_exec` decides whether remote hooks run:
+  - `false` deliberately turns remote hooks off. shipr never probes, and says it skipped them.
+    Use it for SFTP-only hosting.
+  - `true` makes them required: a server without a shell fails the deploy.
+  - `auto` (the default) probes once. A working shell runs the hooks. A server that clearly
+    refuses (OpenSSH's "This service allows sftp connections only.", a nologin shell) skips
+    them with a warning. A check that times out or loses its connection proves nothing, so with
+    remote hooks configured the deploy stops before changing anything, rather than silently
+    skipping a migration.
 - The `local` provider deploys to a folder on this machine, such as a mounted share or for tests.
   It takes `local: {root: /mnt/share}`, and `remote_path` is then resolved inside `root`.
 
@@ -339,7 +346,7 @@ Exports the commit, builds, plans, asks, uploads and records.
 | `--ref REF` | Branch, tag or commit to deploy (default: the environment's `branch`, else `HEAD`) |
 | `-n, --dry-run` | Show the plan and change nothing (no lock, no writes) |
 | `-y, --yes` | Answer yes to the production confirmation and to deletions. Required when not in a terminal. |
-| `--no-delete` | Never delete remote files in this run; they stay on the server and are offered again next time |
+| `--no-delete` | Never delete remote files in this run; they stay on the server and are offered again next time. If keeping them is all that's left to do, the deploy is "up to date": no hooks run and nothing is recorded |
 | `--trust` | As for `test` |
 
 ```bash
@@ -537,6 +544,7 @@ Details are in [docs/security.md](docs/security.md).
 | `authentication failed` | Check `username`, and the password or key. Check the `${VARIABLE}` is set (`shipr validate`). |
 | `could not connect` | Check the host and port and your firewall. Raise `timeout` or `retries` for slow links. |
 | `remote_path ... must be a normalised absolute directory` | Use a full path like `/home/u123/public_html`. `shipr test` prints your login directory. |
+| `could not tell whether ... allows shell commands` | The shell check timed out or the connection dropped, so shipr can't tell whether your remote hooks would run. It stops before changing anything instead of skipping them. Deploy again. If the server really has no shell, set `ssh_exec: false`. |
 | `server has no shell access; ... hooks skipped` | Expected on SFTP-only hosting. Set `ssh_exec: false` to skip the probe, or move the commands into `build.commands`. |
 | `another deploy holds the lock` | Wait for it. If it is dead, run `shipr unlock -e ENV`. |
 | `could not confirm whether moving ... completed` | The connection dropped mid-delete, and shipr couldn't prove whether the file reached its backup folder. Nothing was repeated or undone. Check both paths it names, then deploy again. |

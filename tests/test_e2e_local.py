@@ -925,3 +925,70 @@ def test_hook_finishing_just_before_its_timeout(project):
     project.write("a.txt", "a")
     project.commit()
     assert run(project).status == "success"
+
+
+# --- hook scheduling with kept deletions (Phase 3C: C-12) ------------------------------------
+def kept_deletion_setup(project):
+    """Deployed a.txt + b.txt with a counting hook, then b.txt removed in git."""
+    project.write_config("hooks:\n  remote_after: ['echo x >> hook_runs.txt']\n")
+    project.write("a.txt", "a")
+    project.write("b.txt", "b")
+    project.commit()
+    run(project)
+    (project.repo / "b.txt").unlink()
+    project.commit()
+
+
+def hook_runs(project):
+    return len((project.site / "hook_runs.txt").read_text().split())
+
+
+def test_repeated_no_delete_runs_no_hooks_and_writes_no_records(project):
+    kept_deletion_setup(project)
+    first = run(project, no_delete=True)  # new commit: recorded once, hooks run once
+    assert first.status == "success" and first.kept == ["b.txt"] and hook_runs(project) == 2
+    records = len(list((project.state / "history").iterdir()))
+    before = (project.state / "manifest.json").read_text()
+    for _ in range(3):
+        ui = RecordingUI()
+        rec = run(project, ui=ui, no_delete=True)
+        assert rec.status == "up-to-date" and rec.kept == ["b.txt"]
+        assert "delete  b.txt" in ui.text and "kept" in ui.text  # still listed every time
+    assert hook_runs(project) == 2  # used to be 5
+    assert len(list((project.state / "history").iterdir())) == records
+    assert (project.state / "manifest.json").read_text() == before
+    rec = run(project, yes=True)  # deletion enabled again: it happens, hooks run
+    assert [d.path for d in rec.deleted] == ["b.txt"] and hook_runs(project) == 3
+    assert not (project.site / "b.txt").exists()
+
+
+def test_declining_the_deletion_prompt_is_up_to_date(project):
+    kept_deletion_setup(project)
+    run(project, no_delete=True)
+    rec = run(project, ui=RecordingUI(answers=[False]))
+    assert rec.status == "up-to-date" and hook_runs(project) == 2
+
+
+def test_kept_deletions_do_not_hide_real_work(project):
+    kept_deletion_setup(project)
+    run(project, no_delete=True)
+    project.write("a.txt", "a2")
+    project.commit()
+    rec = run(project, no_delete=True)  # an upload: a real deploy, hooks run once
+    assert [u.path for u in rec.uploaded] == ["a.txt"] and hook_runs(project) == 3
+    assert (project.site / "b.txt").exists()
+
+
+def test_kept_deletions_still_finish_pending_hooks_and_interrupted_deploys(project):
+    kept_deletion_setup(project)
+    run(project, no_delete=True)
+    m = json.loads((project.state / "manifest.json").read_text())
+    m["hooks_pending"] = True
+    (project.state / "manifest.json").write_text(json.dumps(m))
+    rec = run(project, no_delete=True)
+    assert rec.status == "success" and hook_runs(project) == 3
+    m = json.loads((project.state / "manifest.json").read_text())
+    m["in_progress"] = {"deploy_id": "x", "by": "y", "started": "z"}
+    (project.state / "manifest.json").write_text(json.dumps(m))
+    rec = run(project, no_delete=True)
+    assert rec.status == "success" and "in_progress" not in manifest(project)

@@ -116,6 +116,7 @@ class Deployment:
         self.project = cfg.project_name
         self.state = state_for(env, provider)
         self._save_error: str | None = None
+        self._can_exec = False
         self.record = DeployRecord(
             id=new_deploy_id(ws.sha), kind=options.kind, project=cfg.project_name,
             environment=env.name, commit=ws.sha, branch=ws.branch, subject=ws.subject,
@@ -134,12 +135,19 @@ class Deployment:
         self._lock()
         try:
             manifest, remote, plan = self._load_and_plan()
-            if plan.empty and manifest.deployed_commit == self.ws.sha \
-                    and not manifest.in_progress and not manifest.hooks_pending:
-                self.record.status = "up-to-date"
-                self.ui.echo("already up to date")
-                return self.record
+            # deletions only count once approved: kept files are no reason to run hooks
+            other_work = bool(plan.uploads or plan.adopt or plan.forget
+                              or manifest.deployed_commit != self.ws.sha
+                              or manifest.in_progress or manifest.hooks_pending)
+            if not other_work and (not plan.deletes or self.options.no_delete):
+                return self._up_to_date(plan)
+            # before any prompt or change: a shell check that fails stops here, untouched
+            env = self.env
+            self._can_exec = bool(env.hooks.remote_before or env.hooks.remote_after) \
+                and remote_exec_available(env, self.provider)
             deletes = self._confirm(plan)
+            if not other_work and not deletes:
+                return self._up_to_date(plan)
             self._apply(manifest, remote, plan, deletes)
             show_result(self.ui, self.record)
             if self._save_error:
@@ -152,6 +160,17 @@ class Deployment:
                 self.ui.warn(f"could not release lock: {e} (run `shipr unlock`)")
 
     # steps -------------------------------------------------------------------
+    def _up_to_date(self, plan: Plan) -> DeployRecord:
+        """Nothing to do: no hooks run and no records are written. Files removed from the repo
+        but kept on the server stay listed in the plan, and are offered again next time."""
+        self.record.status = "up-to-date"
+        self.record.kept = [o.path for o in plan.deletes]
+        kept = len(self.record.kept)
+        self.ui.echo("already up to date" + (
+            f"; {kept} removed file{'s' if kept != 1 else ''} kept on the server "
+            "(deploy without --no-delete and confirm to remove them)" if kept else ""))
+        return self.record
+
     def _lock(self) -> None:
         """Take the deploy lock; creating it also creates the state dir, so a state dir the
         deploy user can't create is reported here, before anything changes."""
@@ -279,7 +298,7 @@ class Deployment:
         t0 = time.monotonic()
         failed = True
         try:
-            can_exec = has_remote_hooks and remote_exec_available(env, self.provider)
+            can_exec = self._can_exec  # checked in run(), before any change
             if has_remote_hooks:
                 record.hooks = "not-run" if can_exec else "skipped"
             self._hooks(env.hooks.remote_before, "remote_before", can_exec)

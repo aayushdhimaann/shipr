@@ -59,12 +59,22 @@ def _accepts(fn: object, name: str) -> bool:
 
 
 def remote_exec_available(env: Environment, provider: Provider) -> bool:
-    """Honour `ssh_exec`: false = never, true = required, auto = probe the server."""
+    """Honour `ssh_exec`: false = never, true = required, auto = probe the server. With auto,
+    only a server that clearly refuses shell commands means "skip the hooks"; a probe that
+    failed (timeout, dropped connection) stops the deploy instead of skipping them."""
     if env.ssh_exec is False:
         return False
     ok = provider.can_exec()
     if env.ssh_exec is True and not ok:
-        raise DeployError(f"ssh_exec is true but {provider.describe()} cannot run commands")
+        raise DeployError(f"ssh_exec is true but {provider.describe()} cannot run commands"
+                          + (f" ({why})" if (why := provider.exec_probe_error()) else ""))
+    if not ok and (why := provider.exec_probe_error()):
+        raise DeployError(
+            f"could not tell whether {provider.describe()} allows shell commands ({why}). "
+            "This environment has remote hooks, so the deploy stops before changing anything "
+            "rather than silently skipping them. Deploy again to retry the check, set "
+            "`ssh_exec: true` to require the hooks, or `ssh_exec: false` to skip remote hooks "
+            "deliberately.")
     return ok
 
 
@@ -74,5 +84,7 @@ def run_remote_phase(provider: Provider, env: Environment, commands: list[str], 
         return
     if can_exec:
         run_remote(provider, commands, env.remote_path, ui, timeout=env.hooks.timeout)
+    elif env.ssh_exec is False:
+        ui.warn(f"ssh_exec is false: {phase} hooks skipped deliberately")
     else:
         ui.warn(f"server has no shell access; {phase} hooks skipped")

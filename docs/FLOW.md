@@ -339,9 +339,10 @@ Code: `Deployment._confirm · _apply · executor.PlanExecutor · hooks.run_remot
 
 ```mermaid
 flowchart TD
-  s(["plan printed, lock held"]) --> utd{"nothing to do, same commit,<br/>no interrupted deploy?"}
-  utd -- yes --> u["already up to date · exit 0"]
-  utd -- no --> pc{"env.confirm and no --yes?"}
+  s(["plan printed, lock held"]) --> utd{"nothing to do except deletions that won't happen?<br/>(same commit, no uploads, no interrupted deploy, no pending hooks;<br/>no deletions, or --no-delete)"}
+  utd -- yes --> u["already up to date · exit 0<br/>kept files listed · no hooks · no records"]
+  utd -- no --> pb["remote hooks configured? probe the shell once (with timeout)<br/>works: run hooks · explicit refusal (SFTP-only): skip them<br/>no clear answer: DeployError, nothing changed<br/>ssh_exec false: skip, no probe · true: required"]
+  pb --> pc{"env.confirm and no --yes?"}
   pc -- yes --> a1["ask: Deploy SHA to ENV?"]
   a1 -- no --> ab["Aborted · exit 3 · nothing changed"]
   a1 -- yes --> dl
@@ -356,11 +357,10 @@ flowchart TD
   tty -- yes --> a2["ask, showing the full list"]
   a2 -- no --> keep
   a2 -- yes --> apr
-  keep --> hk{"remote hooks configured?"}
-  apr --> hk
-  hk -- no --> pv
-  hk -- yes --> pb["probe shell: echo shipr-ok (with timeout)<br/>ssh_exec false: no · true: required or DeployError"]
-  pb --> rb["remote_before: cd remote_path, run each command<br/>skipped with a warning if no shell"]
+  keep --> nw{"anything left to do?"}
+  nw -- no --> u
+  nw -- yes --> rb
+  apr --> rb["remote_before: cd remote_path, run each command<br/>skipped with a warning if no shell"]
   rb -- fails --> e1["DeployError · status failed"]
   rb --> pv["write .shipr/.htaccess deny<br/>(state folder inside the web root)"]
   pv --> ip["manifest.in_progress = id, user, start · save"]
