@@ -59,6 +59,16 @@ class Hooks(_Model):
     local_after: list[str] = []
     remote_before: list[str] = []
     remote_after: list[str] = []
+    # seconds each hook command may run (local or remote); null = no limit. A remote command
+    # that times out may still be running on the server: shipr can only stop waiting for it.
+    timeout: float | None = 1800
+
+    @field_validator("timeout")
+    @classmethod
+    def _positive(cls, v: float | None) -> float | None:
+        if v is not None and v <= 0:
+            raise ValueError("must be a positive number of seconds, or null for no limit")
+        return v
 
 
 class Environment(BaseModel):

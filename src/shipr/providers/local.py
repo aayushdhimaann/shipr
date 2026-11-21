@@ -10,9 +10,10 @@ from __future__ import annotations
 import os
 import shutil
 import stat as statmod
-import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
+from ..proc import run_shell
 from .base import Provider, ProviderError, RemoteStat, UnsafePath, tmp_name
 
 # Windows: symlinks *and* directory junctions are reparse points (Path.is_symlink misses
@@ -178,11 +179,11 @@ class LocalProvider(Provider):
     def supports_exec(self) -> bool:
         return bool(self.settings.get("exec", True))
 
-    def exec(self, command: str, cwd: str | None = None,
-             timeout: float | None = None) -> tuple[int, str, str]:
-        r = subprocess.run(command, shell=True, cwd=self._p(cwd) if cwd else None,
-                           capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
+    def exec(self, command: str, cwd: str | None = None, timeout: float | None = None,
+             on_output: Callable[[str], None] | None = None) -> tuple[int, str, str]:
+        code, out = run_shell(command, cwd=self._p(cwd) if cwd else None, timeout=timeout,
+                              on_output=on_output, capture=on_output is None)
+        return code, out, ""
 
     def describe(self) -> str:
         return f"local:{self.root}"

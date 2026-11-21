@@ -73,8 +73,27 @@
   lock and the interrupted-deploy marker, and repeats nothing. The next deploy, after
   `shipr unlock`, finishes the job.
 
+### Hook execution (Phase 3B)
+
+- Remote hooks could hang forever and hold the deploy lock. Each hook command now has a timeout,
+  `hooks.timeout` (default 1800 seconds; `null` disables it). A timed-out hook fails the deploy,
+  is not retried in that run, and runs again on the next deploy. The message says the remote
+  command may still be running, since SSH can't promise to stop it.
+- A remote hook writing more than about 2 MB to stderr deadlocked the deploy (reproduced on
+  OpenSSH). stderr is now merged into stdout and read as it arrives.
+- Remote hook output is shown while the command runs, not after it ends.
+- A connection that fails while a hook runs is a clean error, not a traceback.
+- Local hooks and remote hooks on the `local` provider run without stdin, in their own process
+  group, so a timeout or Ctrl-C also stops the processes they started.
+- `sha256sum` batches time out after 300 seconds and fall back to downloading.
+- `Provider.exec` accepts an optional `on_output` callback. Providers without it keep working.
+
 ### Breaking changes
 
+- **Hooks now have a 30-minute default timeout.** Set `hooks.timeout: null` for hooks that
+  legitimately run longer.
+- **`local_before`, `local_after` and `local`-provider hooks no longer read from your
+  terminal**: they get no stdin, so an interactive prompt fails instead of waiting.
 - **`--trust` needs a terminal.** CI jobs that ran `deploy --trust` must pin `sftp.host_key`
   instead. That setup accepted any key, including an attacker's.
 - **New default state location.** Records of new deployments go beside `remote_path`. Existing

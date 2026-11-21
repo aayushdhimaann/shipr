@@ -9,6 +9,7 @@ confirmation of its fingerprint (a terminal prompt), then saved to shipr's own k
 
 from __future__ import annotations
 
+import codecs
 import os
 import posixpath
 import re
@@ -23,13 +24,20 @@ from typing import Any, TypeVar
 import paramiko
 from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, field_validator
 
-from ..errors import AmbiguousOperation, ConnectionLost, ProviderError, UnsafePath
+from ..errors import (
+    AmbiguousOperation,
+    CommandTimeout,
+    ConnectionLost,
+    ProviderError,
+    UnsafePath,
+)
 from ..paths import app_dir
 from .base import Provider, RemoteStat, park_name, tmp_name
 
 T = TypeVar("T")
 TRANSIENT = (paramiko.SSHException, EOFError, socket.timeout, ConnectionError)
 SHA256_BATCH = 200
+SHA256_TIMEOUT = 300  # seconds per batch; on timeout those files are hashed by downloading
 
 
 class SFTPSettings(BaseModel):
@@ -143,6 +151,42 @@ def _attrs(sftp: paramiko.SFTPClient, path: str) -> paramiko.SFTPAttributes | No
         return sftp.stat(path)
     except FileNotFoundError:
         return None
+
+
+def _read_lines(chan: paramiko.Channel, deadline: float | None,
+                on_output: Callable[[str], None] | None) -> str | None:
+    """Read a channel to its end until `deadline` (None: no limit). With `on_output`, each
+    line goes there as it arrives and "" is returned; without, the output is returned exactly
+    as sent. None if the deadline passed first."""
+    decode = codecs.getincrementaldecoder("utf-8")("replace").decode
+    kept: list[str] = []
+    pending = ""
+
+    def emit(line: str) -> None:
+        if on_output:
+            on_output(line.rstrip("\r"))
+    while True:
+        left = None if deadline is None else deadline - time.monotonic()
+        if left is not None and left <= 0:
+            return None
+        chan.settimeout(1.0 if left is None else min(1.0, left))
+        try:
+            data = chan.recv(65536)
+        except TimeoutError:
+            continue
+        if not data:
+            break
+        text = decode(data)
+        if not on_output:
+            kept.append(text)
+            continue
+        *lines, pending = (pending + text).split("\n")
+        for line in lines:
+            emit(line)
+    rest = pending + decode(b"", True)
+    if on_output and rest:
+        emit(rest)
+    return "".join(kept) + ("" if on_output else rest)
 
 
 _SHA256_LINE = re.compile(r"([0-9a-f]{64}) [ *](.*)")
@@ -509,16 +553,39 @@ class SFTPProvider(Provider):
                 self._exec_ok = False
         return self._exec_ok
 
-    def exec(self, command: str, cwd: str | None = None,
-             timeout: float | None = None) -> tuple[int, str, str]:
+    def exec(self, command: str, cwd: str | None = None, timeout: float | None = None,
+             on_output: Callable[[str], None] | None = None) -> tuple[int, str, str]:
+        """Run `command` on the server. stderr is merged into stdout and read as it arrives:
+        reading two streams one after the other can deadlock once the unread one fills the
+        SSH window (2 MiB). Lines go to `on_output` as they arrive (then not returned).
+
+        On timeout shipr stops waiting and closes the channel, but SSH can't promise the
+        command stops: it may still be running on the server (CommandTimeout says so)."""
         if self.client is None:
             raise ProviderError("not connected")
-        if cwd:
-            command = f"cd {shlex.quote(cwd)} && {command}"
-        _, stdout, stderr = self.client.exec_command(command, timeout=timeout)
-        out = stdout.read().decode("utf-8", "replace")
-        err = stderr.read().decode("utf-8", "replace")
-        return stdout.channel.recv_exit_status(), out, err
+        full = f"cd {shlex.quote(cwd)} && {command}" if cwd else command
+        deadline = None if timeout is None else time.monotonic() + timeout
+        try:
+            transport = self.client.get_transport()
+            if transport is None:
+                raise paramiko.SSHException("the connection is closed")
+            chan = transport.open_session(timeout=self.cfg.timeout)
+            try:
+                chan.set_combine_stderr(True)
+                chan.exec_command(full)
+                out = _read_lines(chan, deadline, on_output)
+                left = None if deadline is None else deadline - time.monotonic()
+                if out is None or not chan.status_event.wait(left):
+                    raise CommandTimeout(
+                        f"remote command timed out after {timeout:g}s: {command}. shipr stopped "
+                        "waiting and closed its channel, but the command may still be running "
+                        "on the server; check it before deploying again.")
+                return chan.recv_exit_status(), out, ""
+            finally:
+                chan.close()
+        except (paramiko.SSHException, OSError, EOFError) as e:
+            raise ProviderError(f"could not run remote command on {self.describe()}: "
+                                f"{e or type(e).__name__} ({command})") from None
 
     def sha256(self, paths: list[str]) -> dict[str, str]:
         """Hash with `sha256sum` over SSH where possible, else by downloading."""
@@ -540,7 +607,11 @@ class SFTPProvider(Provider):
         plain = [p for p in paths if "\n" not in p and "\\" not in p]  # never escaped
         for i in range(0, len(plain), SHA256_BATCH):
             batch = plain[i:i + SHA256_BATCH]
-            code, stdout, _ = self.exec("sha256sum -- " + " ".join(map(shlex.quote, batch)))
+            try:
+                code, stdout, _ = self.exec("sha256sum -- " + " ".join(map(shlex.quote, batch)),
+                                            timeout=SHA256_TIMEOUT)
+            except (CommandTimeout, ProviderError):
+                continue  # unhashed: the caller downloads, or treats the hash as unknown
             lines = stdout.splitlines()
             if code != 0 or len(lines) != len(batch):
                 continue

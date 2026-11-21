@@ -102,7 +102,8 @@ def deploy(cfg: Config, env: Environment, ref: str | None = None,
         with open_provider(env, options.trust_new_host, ui.trust_host) as provider:
             record = Deployment(cfg, env, provider, ws, options, ui).run()
         if record.status == "success" and record.changed:
-            run_local(env.hooks.local_after, ws.project_dir, ws.hook_env, ui)
+            run_local(env.hooks.local_after, ws.project_dir, ws.hook_env, ui,
+                      timeout=env.hooks.timeout)
     return record
 
 

@@ -241,6 +241,7 @@ flowchart LR
   class run,rc srv
 ```
 
+- **Remote commands are different.** Hooks and `sha256sum` run on an SSH channel outside the retry loop, and a hook is never retried. stdout and stderr are merged and read as they arrive, so a chatty stderr can't fill the SSH window and stall the command. After `hooks.timeout` seconds (or 300 s for a `sha256sum` batch, which then falls back to downloading), shipr stops waiting. The remote command may keep running.
 - **Fresh client per attempt.** Each operation receives the live SFTP client as an argument, so a retry can never reuse a handle to a closed connection.
 - **A lost reply isn't a failed request.** The server may have carried out a request whose reply never arrived.
   - **Repeated as-is:** reads, uploads (the whole temp-file-and-swap runs again), directory creation, and lock creation (the existing lock is compared with shipr's own content).

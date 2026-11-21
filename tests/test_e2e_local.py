@@ -848,3 +848,80 @@ def test_without_allowlist_commands_still_see_everything(project, monkeypatch):
     run(project)
     seen = set(json.loads((project.site / "env.json").read_text()))
     assert {"SHIPR_PROD_PASSWORD", "SHIPR_KEY_PASSPHRASE", "APP_KEY"} <= seen  # documented
+
+
+# --- hook timeouts (Phase 3B: C-11) ---------------------------------------------------------------
+from shipr.errors import CommandTimeout  # noqa: E402
+
+PY = Path(sys.executable).as_posix()
+
+
+def spawn_child(pid_file: Path) -> str:
+    """A hook that starts a child process (which a naive kill would leave running), records
+    its pid in `pid_file`, and waits."""
+    return (f'"{PY}" -c "import subprocess,sys,time; '
+            "c=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+            f"open('{pid_file.as_posix()}','w').write(str(c.pid)); time.sleep(60)\"")
+
+
+def hooks_yaml(timeout, phase, command):
+    return f"hooks:\n  timeout: {timeout}\n  {phase}: [{json.dumps(command)}]\n"  # JSON is YAML
+
+
+def process_gone(pid: int, wait: float = 5.0) -> bool:
+    import time
+
+    end = time.monotonic() + wait
+    while time.monotonic() < end:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        time.sleep(0.1)
+    return False
+
+
+def test_hook_timeout_is_reported_quickly(project):
+    import time
+
+    project.write_config(hooks_yaml(1, "remote_after", f'"{PY}" -c "import time; time.sleep(30)"'))
+    project.write("a.txt", "a")
+    project.commit()
+    t0 = time.monotonic()
+    with pytest.raises(CommandTimeout, match="timed out after 1s"):
+        run(project)
+    assert time.monotonic() - t0 < 15
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="checks POSIX process ids")
+@pytest.mark.parametrize("phase", ["remote_after", "local_after"])
+def test_timed_out_hook_is_stopped_with_its_child_processes(project, tmp_path, phase):
+    pid_file = tmp_path / "child.pid"
+    project.write_config(hooks_yaml(2, phase, spawn_child(pid_file)))
+    project.write("a.txt", "a")
+    project.commit()
+    with pytest.raises(CommandTimeout, match="stopped it and its child processes"):
+        run(project)
+    assert pid_file.is_file(), "the hook should have recorded its child"
+    assert process_gone(int(pid_file.read_text()))
+
+
+def test_timed_out_hook_runs_again_on_the_next_deploy(project):
+    project.write_config(hooks_yaml(1, "remote_after", f'"{PY}" -c "import time; time.sleep(30)"'))
+    project.write("a.txt", "a")
+    project.commit()
+    with pytest.raises(CommandTimeout):
+        run(project)
+    assert manifest(project)["hooks_pending"]
+    project.write_config(hooks_yaml(30, "remote_after", "echo ran > hook.txt"))
+    rec = run(project)
+    assert rec.status == "success" and rec.hooks == "ok" and (project.site / "hook.txt").exists()
+
+
+def test_hook_finishing_just_before_its_timeout(project):
+    project.write_config(hooks_yaml(5, "remote_after", f'"{PY}" -c "import time; time.sleep(2)"'))
+    project.write("a.txt", "a")
+    project.commit()
+    assert run(project).status == "success"

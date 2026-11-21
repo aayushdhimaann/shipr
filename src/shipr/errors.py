@@ -17,6 +17,10 @@ class DeployError(ShiprError):
     pass
 
 
+class CommandTimeout(DeployError):
+    """A hook command ran longer than `hooks.timeout`. It is never retried in the same run."""
+
+
 class Aborted(ShiprError):
     """The user declined a confirmation."""
 

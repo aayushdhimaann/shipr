@@ -458,3 +458,133 @@ def test_permanent_disconnect_mid_deploy_fails_safely(project, ssh_server, monke
         assert {k: p.read_text(f"{remote}/{k}") for k in p.walk(remote)} == {
             f"f{i}.txt": f"v{i}" for i in range(5)}
     assert set(admin.status(env, "demo").manifest.files) == {f"f{i}.txt" for i in range(5)}
+
+
+# --- remote command execution (Phase 3B: C-11, P-3) ---------------------------------------------
+def run_with_watchdog(p, fn, seconds=60):
+    """Run fn() in a thread; if it is still running after `seconds`, cut the connection and
+    report a hang instead of hanging the test suite."""
+    import threading
+
+    box: dict = {}
+
+    def target():
+        try:
+            box["value"] = fn()
+        except BaseException as e:  # noqa: BLE001
+            box["error"] = e
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        p.client.close()
+        t.join(10)
+        pytest.fail(f"command still blocked after {seconds}s (deadlock)")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def test_large_stderr_output_does_not_deadlock(project, ssh_server):
+    """P-3: more than the 2 MiB SSH window on stderr while stdout is being read."""
+    configure(project, ssh_server, f"      password: {PASSWORD}\n")
+    with provider(project) as p:
+        code, out, err = run_with_watchdog(p, lambda: p.exec(
+            "head -c 6000000 /dev/zero | tr '\\0' e >&2; echo finished"))
+    assert code == 0 and "finished" in out
+    assert len(out) + len(err) > 6_000_000
+
+
+def hook_config(timeout, command):
+    import json
+
+    return f"hooks:\n  timeout: {timeout}\n  remote_after: [{json.dumps(command)}]\n"
+
+
+def test_remote_hook_timeout_then_next_deploy_reruns_hooks(project, ssh_server):
+    import time
+
+    from shipr.errors import CommandTimeout
+
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n",
+                       top=hook_config(2, "sleep 30"))
+    project.write("a.txt", "a")
+    project.commit()
+    t0 = time.monotonic()
+    with pytest.raises(CommandTimeout, match="may still be running on the server"):
+        deploy(project)
+    assert time.monotonic() - t0 < 20  # not the 30 s the command wanted
+    cfg = project.repo / "shipr.yml"
+    cfg.write_text(cfg.read_text().replace('"sleep 30"', '"echo ran > hook.txt"'))
+    rec = deploy(project)  # the timed-out hook is pending: it runs again now
+    assert rec.status == "success" and rec.hooks == "ok" and not rec.uploaded
+    with provider(project) as p:
+        assert p.read_text(f"{remote}/hook.txt").strip() == "ran"
+
+
+def test_remote_hook_finishing_just_before_its_timeout(project, ssh_server):
+    configure(project, ssh_server, f"      password: {PASSWORD}\n",
+              top=hook_config(5, "sleep 3; echo done"))
+    project.write("a.txt", "a")
+    project.commit()
+    ui = RecordingUI()
+    rec = deploy(project, ui=ui)
+    assert rec.status == "success" and "  done" in ui.lines
+
+
+def test_remote_output_is_streamed_while_the_command_runs(project, ssh_server):
+    import time
+
+    configure(project, ssh_server, f"      password: {PASSWORD}\n")
+    seen = []
+    with provider(project) as p:
+        p.exec("echo first; sleep 3; echo second >&2",
+               on_output=lambda line: seen.append((line, time.monotonic())))
+    assert [line for line, _ in seen] == ["first", "second"]  # stderr merged in order
+    assert seen[1][1] - seen[0][1] > 2  # the first line arrived before the command ended
+
+
+def test_dropped_connection_during_a_hook_is_a_clean_error(project, ssh_server, monkeypatch):
+    from click.testing import CliRunner
+
+    from shipr import hooks
+    from shipr.cli import cli
+
+    configure(project, ssh_server, f"      password: {PASSWORD}\n",
+              top=hook_config(60, "echo hi"))
+    project.write("a.txt", "a")
+    project.commit()
+    with provider(project, trust=True):
+        pass
+    real = hooks.run_remote
+
+    def drop_first(provider_, *a, **k):
+        provider_.client.get_transport().close()  # the network dies just as the hook starts
+        return real(provider_, *a, **k)
+    monkeypatch.setattr(hooks, "run_remote", drop_first)
+    monkeypatch.chdir(project.repo)
+    r = CliRunner().invoke(cli, ["deploy"])
+    assert r.exit_code == 1 and "Traceback" not in r.output, r.output
+    assert "could not run remote command" in r.output
+
+
+def test_sha256sum_timeout_falls_back_to_downloading(project, ssh_server, tmp_path,
+                                                     monkeypatch):
+    import hashlib
+
+    from shipr.providers import sftp as sftp_mod
+
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n")
+    f = tmp_path / "f"
+    f.write_text("hash me")
+    monkeypatch.setattr(sftp_mod, "SHA256_TIMEOUT", 1)
+    with provider(project) as p:
+        p.upload(f, f"{remote}/f.txt")
+        real_exec, downloads = p.exec, []
+        p.exec = lambda cmd, **k: real_exec(
+            ("sleep 10; " + cmd) if cmd.startswith("sha256sum") else cmd, **k)
+        real_download = p.download
+        p.download = lambda r, loc: (downloads.append(r), real_download(r, loc))[1]
+        got = p.sha256([f"{remote}/f.txt"])
+    assert got == {f"{remote}/f.txt": hashlib.sha256(b"hash me").hexdigest()}
+    assert downloads == [f"{remote}/f.txt"]

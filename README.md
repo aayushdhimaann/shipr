@@ -175,6 +175,7 @@ hooks:
   remote_before: []              # run on the server, in remote_path, before uploading
   remote_after: []               # run on the server, in remote_path, after a fully successful upload
                                  # hooks can run more than once: make them safe to repeat (below)
+  timeout: 1800                  # seconds each hook command may run (null = no limit)
 
 defaults: {}                     # any environment key below, applied to every environment
 
@@ -370,6 +371,21 @@ phase again, including any that had already succeeded, because shipr doesn't tra
 one. Write hooks so that running them twice is safe: `npm ci`, `composer install`, cache clears,
 `php artisan migrate` (it skips applied migrations) and `pm2 reload` are fine. A hook that sends
 an email or appends to a file on every run is not.
+
+### Hook output and timeouts
+
+Remote hooks show their output as it arrives, with stderr merged into stdout in order. Each
+hook command may run for `hooks.timeout` seconds (default 1800; `null` means no limit). A
+command that runs longer fails the deploy, is **not** retried in that run, and runs again on the
+next deploy (see above). Two limits apply:
+
+- **A timed-out remote command may still be running on the server.** SSH lets shipr stop
+  waiting and close the channel, but not reliably stop the command. Check the server before
+  deploying again, especially for migrations.
+- **Local hooks** (`local_before`, `local_after`, and remote hooks on the `local` provider) run
+  without a terminal for input, in their own process group. On timeout or Ctrl-C, shipr stops
+  the command *and the processes it started*. Build commands (`build.commands`) have no timeout
+  and run exactly as in your terminal.
 
 ### `shipr rollback -e ENV`
 Redeploys an earlier commit through the normal pipeline, so only the files that differ change

@@ -19,7 +19,7 @@ paths on the target.
 | `rename(src, dst)` | Move a file, creating parent dirs. Fail if `dst` exists. |
 | `rmdir_if_empty(path) -> bool` | Remove an empty directory. |
 | `create_exclusive(path, text) -> bool` | Create only if the file is absent. This backs the deploy lock, so it must be atomic. |
-| `supports_exec()` / `exec(cmd, cwd, timeout)` | Optional: can the target run shell commands, and run one. The base `can_exec()` already applies the user's `ssh_exec: false`. |
+| `supports_exec()` / `exec(cmd, cwd, timeout, on_output=None)` | Optional: can the target run shell commands, and run one. The base `can_exec()` already applies the user's `ssh_exec: false`. Raise `CommandTimeout` after `timeout` seconds. Pass each output line to `on_output` as it arrives, if given. Providers written before `on_output` existed still work: their output is shown when the command ends. Never retry a command yourself, because hooks aren't necessarily safe to repeat. Wrap transport errors in `ProviderError`. |
 | `read_text`, `write_text`, `copy`, `sha256` | Optional. The base class implements them on top of `upload`/`download` (atomic, mode-preserving); override them only if you have something faster. |
 | `describe()` / `diagnostics()` | A short target name for output, and extra lines for `shipr test`. |
 

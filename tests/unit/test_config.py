@@ -196,3 +196,14 @@ def test_local_provider_compares_real_paths(tmp_path):
 def test_default_state_dir_is_beside_the_web_root(tmp_path, remote, state):
     env = make(tmp_path, {"environments": {"prod": env_raw(remote)}}).env("prod")
     assert env.effective_state_path == state and env.state_rel is None
+
+
+def test_hook_timeout_defaults_to_30_minutes_and_can_be_disabled(tmp_path):
+    raw = {"environments": {"prod": {"remote_path": "/w"}}}
+    assert make(tmp_path, raw).env("prod").hooks.timeout == 1800
+    raw["hooks"] = {"timeout": None}
+    assert make(tmp_path, raw).env("prod").hooks.timeout is None
+    for bad in (0, -5, "soon"):
+        raw["hooks"] = {"timeout": bad}
+        with pytest.raises(ConfigError, match="timeout"):
+            make(tmp_path, raw).env("prod")

@@ -108,9 +108,14 @@ class Provider(ABC):
         """Override: can this target run shell commands? (may probe and cache)"""
         return False
 
-    def exec(self, command: str, cwd: str | None = None,
-             timeout: float | None = None) -> tuple[int, str, str]:
-        """Run a shell command on the target; returns (exit code, stdout, stderr)."""
+    def exec(self, command: str, cwd: str | None = None, timeout: float | None = None,
+             on_output: Callable[[str], None] | None = None) -> tuple[int, str, str]:
+        """Run a shell command on the target; returns (exit code, stdout, stderr).
+
+        `timeout`: stop waiting after that many seconds and raise CommandTimeout. `on_output`
+        (optional; providers written before it still work): called with each output line as
+        it arrives; the returned output may then be empty. Never retry the command yourself:
+        hooks aren't necessarily safe to repeat."""
         raise ExecNotSupported(f"{self.name} provider cannot run remote commands")
 
     # generic implementations built on upload/download; override if faster --

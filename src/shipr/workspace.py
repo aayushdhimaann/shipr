@@ -80,7 +80,7 @@ def _build(cfg: Config, env: Environment, ref: str | None, ui: UI, tmp: Path) ->
     project_dir = _inside(export_root, export_root / rel_project / env.source,
                           f"source directory {env.source!r} not found in {sha[:7]}")
     hook_env = command_env(cfg, env, sha)
-    run_local(env.hooks.local_before, project_dir, hook_env, ui)
+    run_local(env.hooks.local_before, project_dir, hook_env, ui, timeout=env.hooks.timeout)
     run_local(env.build.commands, project_dir, hook_env, ui)
     out_dir = _inside(export_root, project_dir / env.build.output,
                       f"build output {env.build.output!r} does not exist")
