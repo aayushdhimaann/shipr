@@ -13,10 +13,11 @@ from .engine import (
     state_for,
     state_warnings,
 )
-from .errors import DeployError, ProviderError
+from .errors import Aborted, DeployError, LockedError, ProviderError
 from .hooks import remote_exec_available
 from .models import DeployRecord, Manifest
 from .planner import blocked_reason, stat_matches
+from .state import LockInfo
 from .ui import UI
 
 
@@ -56,13 +57,34 @@ def history(env: Environment) -> list[DeployRecord]:
         return state_for(env, provider).list_history()
 
 
-def unlock(env: Environment) -> str | None:
-    """Remove the deploy lock; returns who held it."""
+def unlock(env: Environment, ui: UI, deploy_id: str | None = None) -> str:
+    """Remove the deploy lock, but only the one meant: the one held by `deploy_id`, or the one
+    shown to the person who confirmed. Never on age alone, and never a lock that changed in
+    between. Returns what happened."""
     with open_provider(env) as provider:
         state = state_for(env, provider)
-        info = state.read_lock()
-        state.release_lock()
-        return info
+        held = state.read_lock()
+        if held is None:
+            return "no lock was held"
+        info = LockInfo.parse(held)
+        shown = info.describe()
+        by_id = (f"`shipr unlock -e {env.name} --id {info.deploy_id}`" if info.deploy_id
+                 else f"`shipr unlock -e {env.name}` in a terminal")
+        if deploy_id is not None:
+            if info.deploy_id != deploy_id:
+                raise LockedError(f"the lock is held by {shown}, not by deploy {deploy_id}; "
+                                  f"nothing was removed. To remove it, run {by_id}.")
+        elif not ui.confirm(f"The deploy lock is held by {shown}.\nRemove it only if that "
+                            "deploy is no longer running. Remove it?"):
+            raise Aborted(f"lock kept. To remove it without a prompt, run {by_id}.")
+        outcome = state.remove_lock(held)
+        if outcome == "changed":
+            raise LockedError("the lock changed after it was read (its holder finished and "
+                              "another deploy took it); nothing was removed. Run `shipr unlock` "
+                              "again to see the new holder.")
+        if outcome == "missing":
+            return f"the lock was already released ({shown})"
+        return f"removed lock: {shown}"
 
 
 def check_connection(env: Environment, trust: bool, ui: UI) -> bool:

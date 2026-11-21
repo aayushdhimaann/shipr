@@ -54,7 +54,9 @@ def resolve_target(cfg: Config, env: Environment, ref: str | None) -> tuple[Path
         sha = gitops.resolve(target, repo)
     except GitError:
         raise DeployError(f"unknown git ref {target!r}") from None
-    branch = gitops.current_branch(repo) if target == "HEAD" else target
+    # a tag or commit is not a branch: recording it as one made history misleading
+    branch = gitops.current_branch(repo) if target == "HEAD" \
+        else gitops.branch_at(target, sha, repo)
     return repo, sha, branch
 
 

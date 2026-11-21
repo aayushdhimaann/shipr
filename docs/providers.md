@@ -43,6 +43,11 @@ via temp file and rename, mkdir. For `rename` and `delete`, check the target fir
 `AmbiguousOperation` (a `ProviderError`) when you can't prove what happened. Never guess,
 and never undo. The executor records it as a failed file and the deploy continues.
 
+The deploy lock is removed with `delete_if_content(path, expected)`. The default reads the file
+and deletes it only if it still holds `expected`. If your provider retries deletes after a
+reconnect, override it to re-read before every attempt, as `sftp.py` does, so that a retry never
+deletes a lock another deploy created in the meantime.
+
 Import the error types from `shipr.providers.base` (they are defined in `shipr.errors`).
 Raise `ConnectionLost` when the connection dropped and your retries are exhausted. The engine then
 stops instead of trying the remaining files. For other per-file errors, raise `OSError` or

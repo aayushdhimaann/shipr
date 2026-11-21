@@ -107,3 +107,34 @@ def test_validate_catches_provider_settings_and_duplicate_keys(tmp_path, monkeyp
                    "    sftp: {host: h, username: u, password: x, password: y}\n")
     r = CliRunner().invoke(cli, ["validate"])
     assert r.exit_code == 1 and "duplicate key 'password'" in r.output and "line 5" in r.output
+
+
+def test_unlock_cli_never_removes_a_lock_unseen(project, monkeypatch):
+    import json as j
+
+    monkeypatch.chdir(project.repo)
+    project.state.mkdir(parents=True)
+    lock = project.state / "lock"
+    lock.write_text(j.dumps({"by": "b@ci", "since": "2026-11-21T10:00:00Z",
+                             "deploy_id": "deploy-B"}))
+    r = CliRunner().invoke(cli, ["status"])
+    assert "locked: deploy deploy-B by b@ci" in r.output, r.output
+    for args in (["unlock", "--yes"], ["unlock"]):  # --yes can't confirm what nobody saw
+        r = CliRunner().invoke(cli, args)
+        assert r.exit_code == 3 and "deploy deploy-B by b@ci" in r.output, (args, r.output)
+        assert "shipr unlock -e prod --id deploy-B" in r.output and lock.exists()
+    r = CliRunner().invoke(cli, ["unlock", "--id", "deploy-A"])
+    assert r.exit_code == 1 and "not by deploy deploy-A" in r.output and lock.exists()
+    r = CliRunner().invoke(cli, ["unlock", "--id", "deploy-B"])
+    assert r.exit_code == 0 and "removed" in r.output and not lock.exists()
+    r = CliRunner().invoke(cli, ["unlock"])
+    assert r.exit_code == 0 and "no lock" in r.output
+
+
+def test_status_does_not_print_a_missing_branch(project, monkeypatch):
+    monkeypatch.chdir(project.repo)
+    project.write("a.txt", "a")
+    sha = project.commit()
+    assert CliRunner().invoke(cli, ["deploy", "--ref", sha]).exit_code == 0
+    r = CliRunner().invoke(cli, ["status"])
+    assert "None" not in r.output and sha[:7] in r.output, r.output

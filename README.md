@@ -417,16 +417,20 @@ manifest couldn't be saved), rollback refuses to guess and asks for `--to`.
 
 | Option | |
 |---|---|
-| `--to ID\|COMMIT` | A deploy id, or a commit prefix, from `shipr history` (default: the previous deploy) |
+| `--to ID\|COMMIT` | A deploy id, or a commit prefix of at least 4 characters, from `shipr history` (default: the previous deploy). A prefix that matches more than one deployed commit is refused, with the candidates listed. |
 | `-n`, `-y`, `--no-delete` | As for `deploy` |
 
 ### `shipr unlock -e ENV`
-Removes the deploy lock left by a deploy that was killed hard (power loss, `kill -9`). Use it only
-when no deploy is running.
+Removes the deploy lock left by a deploy that was killed hard (power loss, `kill -9`) or lost its
+connection for good. Use it only when no deploy is running. It shows which deploy holds the lock
+(deploy id, user and machine, and how long ago it started) and asks. It removes only that exact
+lock: if another deploy took the lock in the meantime, nothing is removed. Locks never expire on
+their own, however old: shipr can't tell a slow deploy from a dead one.
 
 | Option | |
 |---|---|
-| `-y, --yes` | Don't ask for confirmation |
+| `--id DEPLOY_ID` | Remove the lock only if that deploy holds it, without a prompt (for scripts). The "another deploy holds the lock" error prints the exact command. |
+| `-y, --yes` | Not enough on its own: shipr never removes a lock nobody has seen. It shows the holder and the `--id` command instead (exit code 3). |
 
 ### Exit codes
 
@@ -459,7 +463,7 @@ previous deploy, or add `--to <id>` for a specific one.
 the interruption and uploads only what is still missing. After a hard kill (`kill -9`, power
 loss), or a network that never came back during the deploy, the lock is still on the server.
 shipr won't guess that its holder is dead, so check that no deploy is running, then run
-`shipr unlock` first.
+the `shipr unlock -e ENV --id <deploy id>` command the error prints.
 
 **Deploy from CI** (GitHub Actions example):
 
@@ -560,7 +564,10 @@ Details are in [docs/security.md](docs/security.md).
 | `remote_path ... must be a normalised absolute directory` | Use a full path like `/home/u123/public_html`. `shipr test` prints your login directory. |
 | `could not tell whether ... allows shell commands` | The shell check timed out or the connection dropped, so shipr can't tell whether your remote hooks would run. It stops before changing anything instead of skipping them. Deploy again. If the server really has no shell, set `ssh_exec: false`. |
 | `server has no shell access; ... hooks skipped` | Expected on SFTP-only hosting. Set `ssh_exec: false` to skip the probe, or move the commands into `build.commands`. |
-| `another deploy holds the lock` | Wait for it. If it is dead, run `shipr unlock -e ENV`. |
+| `another deploy holds the lock` | Wait for it. If it is dead, run the `shipr unlock -e ENV --id ...` command the message prints. |
+| `this deploy's lock was removed or taken over while it waited` | Someone ran `shipr unlock` while your deploy waited at a prompt. Nothing was changed. Check `shipr status`, then deploy again. |
+| `the deploy lock is now held by another deploy` | This deploy's lock was removed while it ran, and another deploy took it. shipr left that lock alone. Check `shipr status` and `shipr history`: the two deploys may have overlapped. |
+| `... matches N deployed commits` | `rollback --to` got a commit prefix that fits several deploys. Use more characters, or the deploy id from `shipr history`. |
 | `could not confirm whether moving ... completed` | The connection dropped mid-delete, and shipr couldn't prove whether the file reached its backup folder. Nothing was repeated or undone. Check both paths it names, then deploy again. |
 | `unknown git ref` / `commit ... is not in your local repo` | Run `git fetch`, then check the branch, tag or commit exists. |
 | `you have uncommitted changes` | Only committed content is deployed. Commit first if you want those changes live. |

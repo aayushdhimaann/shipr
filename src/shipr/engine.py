@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 from . import gitops, providers
 from .config import Config, Environment
-from .errors import Aborted, DeployError, ProviderError, StateError, UnsafePath
+from .errors import Aborted, DeployError, LockedError, ProviderError, StateError, UnsafePath
 from .executor import PlanExecutor
 from .hooks import remote_exec_available, run_local, run_remote_phase
 from .models import DeployRecord, InProgress, Kind, Manifest
@@ -60,7 +60,7 @@ def state_for(env: Environment, provider: Provider) -> RemoteState:
                 f"If you moved them to {root}, delete {env.legacy_state_path}. Otherwise set "
                 "`state_path` to the one to keep using.")
         root, legacy = env.legacy_state_path, True
-    return RemoteState(provider, root, env.remote_path, legacy)
+    return RemoteState(provider, root, env.remote_path, legacy, env_name=env.name)
 
 
 def default_location_warning(env: Environment, state: RemoteState) -> str | None:
@@ -148,16 +148,38 @@ class Deployment:
             deletes = self._confirm(plan)
             if not other_work and not deletes:
                 return self._up_to_date(plan)
+            if not self.state.lock_owned():  # a prompt can wait long enough for an unlock
+                raise LockedError(
+                    "this deploy's lock was removed or taken over while it waited (did someone "
+                    "run `shipr unlock`?), so another deploy may be running; nothing was "
+                    "changed. Check `shipr status`, then deploy again.")
             self._apply(manifest, remote, plan, deletes)
             show_result(self.ui, self.record)
             if self._save_error:
                 raise StateError(self._save_error)
             return self.record
         finally:
-            try:
-                self.state.release_lock(self.record.id)
-            except Exception as e:  # never mask the deploy's own outcome
-                self.ui.warn(f"could not release lock: {e} (run `shipr unlock`)")
+            self._unlock()
+
+    def _unlock(self) -> None:
+        """Release this deploy's own lock; never another deploy's, and never mask the deploy's
+        own outcome."""
+        try:
+            outcome = self.state.release_lock()
+        except Exception as e:
+            self.ui.warn(f"could not release the deploy lock ({e}). Once no deploy is running, "
+                         f"remove it with `shipr unlock -e {self.env.name} --id "
+                         f"{self.record.id}`")
+            return
+        check = ("another deploy may have run at the same time: check `shipr status` and "
+                 "`shipr history`")
+        if outcome == "changed":
+            self.ui.warn("the deploy lock is now held by another deploy, so shipr left it in "
+                         "place. If this deploy's lock was removed while it ran (`shipr "
+                         f"unlock`), {check}.")
+        elif outcome == "missing":
+            self.ui.warn("this deploy's lock was removed while it ran (`shipr unlock`?); "
+                         f"{check}.")
 
     # steps -------------------------------------------------------------------
     def _up_to_date(self, plan: Plan) -> DeployRecord:
@@ -416,6 +438,28 @@ def rollback(cfg: Config, env: Environment, to: str | None = None,
     return deploy(cfg, env, target.commit, options, ui)
 
 
+def _pick(records: list[DeployRecord], to: str) -> DeployRecord:
+    """`--to`: an exact deploy id, else a commit prefix of at least 4 hex digits that matches
+    exactly one deployed commit. Never a guess between several."""
+    exact = [r for r in records if r.id == to]
+    if exact:
+        return exact[-1]
+    prefix = to.lower()
+    if len(prefix) < 4 or any(c not in "0123456789abcdef" for c in prefix):
+        raise DeployError(f"no completed deploy has the id {to!r}, and a commit prefix needs at "
+                          "least 4 hex digits (see `shipr history`)")
+    hits = [r for r in records if r.commit.startswith(prefix)]
+    commits = list(dict.fromkeys(r.commit for r in hits))
+    if not commits:
+        raise DeployError(f"no completed deploy matches {to!r} (see `shipr history`)")
+    if len(commits) > 1:
+        listed = "\n".join(f"  {c[:12]}  (deploy {next(r.id for r in hits if r.commit == c)})"
+                            for c in commits)
+        raise DeployError(f"{to!r} matches {len(commits)} deployed commits:\n{listed}\nGive "
+                          "more of the commit, or a deploy id.")
+    return hits[-1]
+
+
 def rollback_target(records: list[DeployRecord], current: str | None,
                     to: str | None, interrupted: bool = False) -> DeployRecord:
     if interrupted and not to:
@@ -426,10 +470,7 @@ def rollback_target(records: list[DeployRecord], current: str | None,
                               "recorded; choose one with --to (see `shipr history`)")
         return same[-1]
     if to:
-        matches = [r for r in records if r.id == to or r.commit.startswith(to)]
-        if not matches:
-            raise DeployError(f"no successful deploy matches {to!r} (see `shipr history`)")
-        return matches[-1]
+        return _pick(records, to)
     # Step back past the deploy that *introduced* the current commit, not a later rollback
     # to it, so repeated rollbacks keep going back instead of toggling.
     idx = max((i for i, r in enumerate(records)

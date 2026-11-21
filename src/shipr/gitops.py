@@ -37,6 +37,15 @@ def current_branch(cwd: Path) -> str | None:
     return None if name in ("", "HEAD") else name
 
 
+def branch_at(ref: str, sha: str, cwd: Path) -> str | None:
+    """`ref` if it names a local or remote-tracking branch pointing at `sha`, else None."""
+    for full in (f"refs/heads/{ref}", f"refs/remotes/{ref}"):
+        if git("rev-parse", "--verify", "--quiet", f"{full}^{{commit}}", cwd=cwd,
+               check=False) == sha:
+            return ref
+    return None
+
+
 def dirty_files(cwd: Path) -> list[str]:
     out = git("status", "--porcelain", "--untracked-files=no", cwd=cwd)
     return [line[3:] for line in out.splitlines() if line]

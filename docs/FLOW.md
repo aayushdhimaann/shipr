@@ -257,8 +257,8 @@ flowchart TD
   s(["Deployment.run"]) --> dr{"--dry-run?"}
   dr -- yes --> lp1["load manifest + walk server + make plan<br/>(no lock, nothing written)"]
   lp1 --> show1["print plan · status dry-run · exit 0"]
-  dr -- no --> lk["create .shipr/lock exclusively<br/>content: user@host, time, deploy id"]
-  lk -- "already exists, other content" --> e1["LockedError: another deploy holds the lock<br/>exit 1"]
+  dr -- no --> lk["create .shipr/lock exclusively<br/>content: user@host, time, deploy id, random token"]
+  lk -- "already exists, other content" --> e1["LockedError: names the holder, its age<br/>and the exact unlock --id command · exit 1"]
   lk -- "exists with our own content<br/>(reply lost in a reconnect)" --> man
   lk -- created --> man["read .shipr/manifest.json<br/>missing: empty manifest · corrupt: StateError"]
   man --> w1["warn if in_progress is set<br/>(earlier deploy was interrupted; this run finishes it)"]
@@ -468,7 +468,7 @@ stateDiagram-v2
   [*] --> Unlocked
   Unlocked --> Locked: deploy creates .shipr/lock
   Locked --> LockBusy: lock already held
-  LockBusy --> Unlocked: wait, or shipr unlock if the holder is dead
+  LockBusy --> Unlocked: wait, or shipr unlock --id if the holder is dead
   Locked --> Unlocked: up to date, or cancelled at a prompt
   Locked --> InProgress: in_progress saved to manifest
   InProgress --> InProgress: checkpoint every 25 files
@@ -530,7 +530,7 @@ flowchart TB
   end
   subgraph S3["shipr unlock"]
     direction LR
-    u1["confirm, or -y"] --> u2["connect"] --> u3["read and delete .shipr/lock"]
+    u1["connect"] --> u2["read .shipr/lock, show holder and age"] --> u3["--id matches, or a person confirms<br/>(--yes alone refuses)"] --> u4["delete only if the lock is still<br/>exactly what was shown"]
   end
   subgraph S4["shipr test"]
     direction LR

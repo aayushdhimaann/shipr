@@ -267,9 +267,10 @@ def test_lock_release_only_removes_own_lock(project):
     with LocalProvider({"root": str(project.server)}) as p:
         st = RemoteState(p, "/site/.shipr", "/site")
         st.acquire_lock("deploy-1")
-        st.release_lock("deploy-2")  # someone else's id: must not remove it
+        other = RemoteState(p, "/site/.shipr", "/site")  # another deploy: holds no lock
+        assert other.release_lock() == "not-held"
         assert st.read_lock() and "deploy-1" in st.read_lock()
-        st.release_lock("deploy-1")
+        assert st.release_lock() == "deleted"
         assert st.read_lock() is None
 
 
@@ -1038,3 +1039,207 @@ def test_default_excludes_on_is_quiet(project):
     run(project, ui=ui)
     assert "default_excludes" not in ui.text and "build.env" not in ui.text
     assert ".env" not in project.remote_files()
+
+
+# --- deploy lock (Phase 3E: C-19) ----------------------------------------------------------------
+from shipr import state as state_mod  # noqa: E402
+from shipr.ui import UI  # noqa: E402
+
+OTHER_LOCK = json.dumps({"by": "b@ci", "since": "2026-11-21T10:00:00Z", "deploy_id": "deploy-B",
+                         "token": "f" * 16})
+
+
+def lock_file(project):
+    return project.state / "lock"
+
+
+def prompting_ui(on_prompt):
+    """A UI whose confirmation prompt runs `on_prompt` (another actor, while we wait), then
+    answers yes."""
+    lines = []
+    ui = UI(echo=lines.append, confirm=lambda msg: (on_prompt(), True)[1])
+    ui.lines = lines
+    return ui
+
+
+def confirm_project(project):
+    project.write("a.txt", "a")
+    project.commit()
+    add_env_option(project, "confirm: true")
+
+
+def test_concurrent_deploy_is_refused_with_the_holder_and_the_remedy(project):
+    confirm_project(project)
+    refused = []
+
+    def second_deploy():
+        with pytest.raises(LockedError) as e:
+            run(project, yes=True)
+        refused.append(str(e.value))
+    rec = run(project, ui=prompting_ui(second_deploy))
+    assert rec.status == "success" and not lock_file(project).exists()
+    assert f"deploy {rec.id} by" in refused[0]
+    assert f"shipr unlock -e prod --id {rec.id}" in refused[0]
+
+
+def test_lock_taken_over_during_the_prompt_stops_before_any_change(project):
+    confirm_project(project)
+
+    def unlock_and_lock_again():  # someone ran `shipr unlock`, and another deploy started
+        lock_file(project).write_text(OTHER_LOCK)
+    ui = prompting_ui(unlock_and_lock_again)
+    with pytest.raises(LockedError, match="nothing was changed"):
+        run(project, ui=ui)
+    assert not (project.site / "a.txt").exists() and not (project.state / "history").exists()
+    assert lock_file(project).read_text() == OTHER_LOCK  # theirs, untouched
+    assert any("now held by another deploy" in line for line in ui.lines)
+
+
+def test_lock_removed_during_the_prompt_also_stops(project):
+    confirm_project(project)
+    with pytest.raises(LockedError, match="nothing was changed"):
+        run(project, ui=prompting_ui(lambda: lock_file(project).unlink()))
+    assert not (project.site / "a.txt").exists() and not lock_file(project).exists()
+
+
+def test_lock_taken_over_mid_deploy_is_left_in_place_with_a_warning(project, monkeypatch):
+    from shipr.providers.local import LocalProvider
+
+    project.write("a.txt", "a")
+    project.commit()
+    real = LocalProvider.upload
+
+    def upload(self, local, remote, mode=None):
+        if remote.startswith("/site/"):
+            lock_file(project).write_text(OTHER_LOCK)
+        return real(self, local, remote, mode)
+    monkeypatch.setattr(LocalProvider, "upload", upload)
+    ui = RecordingUI()
+    run(project, ui=ui)
+    assert lock_file(project).read_text() == OTHER_LOCK
+    assert "now held by another deploy" in ui.text and "shipr status" in ui.text
+
+
+def test_interrupted_deploy_releases_its_own_lock(project, monkeypatch):
+    from shipr.providers.local import LocalProvider
+
+    project.write("a.txt", "a")
+    project.commit()
+    real = LocalProvider.upload
+
+    def upload(self, local, remote, mode=None):
+        if remote.startswith("/site/"):  # a site file, not shipr's records
+            raise KeyboardInterrupt
+        return real(self, local, remote, mode)
+    monkeypatch.setattr(LocalProvider, "upload", upload)
+    with pytest.raises(KeyboardInterrupt):
+        run(project)
+    assert not lock_file(project).exists() and manifest(project)["in_progress"]
+
+
+def test_lock_that_cannot_be_released_names_the_exact_unlock_command(project, monkeypatch):
+    from shipr.providers.local import LocalProvider
+
+    project.write("a.txt", "a")
+    project.commit()
+    real = LocalProvider.delete
+
+    def delete(self, path):
+        if path.endswith("/lock"):
+            raise OSError("network is down")
+        return real(self, path)
+    monkeypatch.setattr(LocalProvider, "delete", delete)
+    ui = RecordingUI()
+    rec = run(project, ui=ui)
+    assert f"shipr unlock -e prod --id {rec.id}" in ui.text and lock_file(project).exists()
+
+
+def test_stale_lock_is_never_removed_automatically(project):
+    project.write("a.txt", "a")
+    project.commit()
+    project.state.mkdir(parents=True)
+    old = json.dumps({"by": "gone@laptop", "since": "2020-01-01T00:00:00Z",
+                      "deploy_id": "deploy-old"})  # also: a lock from before the token
+    lock_file(project).write_text(old)
+    with pytest.raises(LockedError, match=r"deploy deploy-old by gone@laptop.*ago"):
+        run(project)
+    assert lock_file(project).read_text() == old
+
+
+def unlock(project, answers=(), deploy_id=None):
+    ui = RecordingUI(answers=answers)
+    return admin.unlock(load_env(project.repo)[1], ui, deploy_id), ui
+
+
+def test_unlock_shows_the_holder_before_asking(project):
+    project.state.mkdir(parents=True)
+    lock_file(project).write_text(OTHER_LOCK)
+    with pytest.raises(Aborted, match="--id deploy-B"):
+        unlock(project, answers=[False])
+    assert lock_file(project).exists()
+    msg, ui = unlock(project, answers=[True])
+    assert "deploy deploy-B by b@ci" in ui.prompts[0] and "deploy-B" in msg
+    assert not lock_file(project).exists()
+
+
+def test_unlock_with_id_removes_only_that_lock(project):
+    project.state.mkdir(parents=True)
+    lock_file(project).write_text(OTHER_LOCK)
+    with pytest.raises(LockedError, match="not by deploy deploy-A"):
+        unlock(project, deploy_id="deploy-A")
+    assert lock_file(project).exists()
+    msg, ui = unlock(project, deploy_id="deploy-B")
+    assert not ui.prompts and not lock_file(project).exists()
+
+
+def test_unlock_never_removes_a_lock_that_changed_after_it_was_shown(project):
+    project.state.mkdir(parents=True)
+    lock_file(project).write_text(OTHER_LOCK)
+    newer = OTHER_LOCK.replace("deploy-B", "deploy-C")
+
+    class Swapping(RecordingUI):
+        def _confirm(self, msg):  # the holder finished and another deploy locked meanwhile
+            lock_file(project).write_text(newer)
+            return True
+    with pytest.raises(LockedError, match="changed"):
+        admin.unlock(load_env(project.repo)[1], Swapping())
+    assert lock_file(project).read_text() == newer
+
+
+def test_unrecognised_lock_needs_a_person_to_look_at_it(project):
+    project.state.mkdir(parents=True)
+    lock_file(project).write_text("")  # e.g. a disk that filled up
+    with pytest.raises(LockedError, match="unrecognised"):
+        unlock(project, deploy_id="anything")
+    assert lock_file(project).exists()
+    unlock(project, answers=[True])
+    assert not lock_file(project).exists()
+
+
+def test_lock_info_of_a_real_lock(project):
+    seen = []
+    confirm_project(project)
+    run(project, ui=prompting_ui(lambda: seen.append(state_mod.LockInfo.parse(lock_file(project)
+                                                                    .read_text()))))
+    assert seen[0].deploy_id and seen[0].by
+
+
+# --- branch recorded for a deploy (Phase 3E: C-20) -----------------------------------------------
+def test_branch_is_recorded_only_for_a_branch(project):
+    from tests.conftest import git
+
+    project.write("a.txt", "1")
+    sha1 = project.commit()
+    git(project.repo, "tag", "v1")
+    assert run(project).branch == "main"  # HEAD on main
+    project.write("a.txt", "2")
+    project.commit()
+    assert run(project, ref="main").branch == "main"
+    rec = run(project, ref=sha1)
+    assert rec.branch is None and manifest(project).get("branch") is None
+    project.write("a.txt", "3")
+    project.commit()
+    assert run(project, ref="v1").branch is None  # a tag, not a branch
+    cfg, env = load_env(project.repo)
+    rec = engine.rollback(cfg, env, options=engine.DeployOptions(yes=True), ui=RecordingUI())
+    assert rec.kind == "rollback" and rec.branch is None

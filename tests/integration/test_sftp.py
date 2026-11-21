@@ -415,7 +415,7 @@ def test_lost_delete_and_lock_release_replies(project, ssh_server, tmp_path, mon
         state = RemoteState(p, load_env(project.repo)[1].effective_state_path, remote)
         state.acquire_lock("deploy-1")
         drop_after(monkeypatch, p, "remove")
-        state.release_lock("deploy-1")  # used to raise on the retry
+        state.release_lock()  # used to raise on the retry
         assert state.read_lock() is None
 
 
@@ -448,9 +448,10 @@ def test_permanent_disconnect_mid_deploy_fails_safely(project, ssh_server, monke
     monkeypatch.setattr(SFTPProvider, "_connect_once", real_connect)
 
     env = load_env(project.repo)[1]
-    with pytest.raises(LockedError):  # the lock couldn't be released: never guessed stale
+    with pytest.raises(LockedError) as e:  # the lock couldn't be released: never guessed stale
         helpers.deploy(project.repo)
-    assert admin.unlock(env)
+    held = str(e.value).split("--id ")[1].split("`")[0]  # the message names the exact command
+    assert admin.unlock(env, RecordingUI(), held).startswith("removed lock")
     ui = RecordingUI()
     rec = helpers.deploy(project.repo, ui)
     assert rec.status == "success" and "interrupted" in ui.text
@@ -652,3 +653,59 @@ def test_ssh_exec_false_skips_hooks_deliberately(project, ssh_server):
     assert "ssh_exec is false" in ui.text
     with provider(project) as p:
         assert p.stat(f"{remote}/hook.txt") is None
+
+
+# --- deploy lock ownership (Phase 3E: C-19) -------------------------------------------------
+def test_lock_release_after_lost_reply_keeps_a_newer_lock(project, ssh_server, monkeypatch):
+    from shipr.providers.sftp import SFTPProvider
+    from shipr.state import RemoteState
+
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n")
+    newer = '{"deploy_id": "deploy-B", "by": "b@ci", "since": "2026-11-21T10:00:00Z"}'
+    with provider(project) as p:
+        state = RemoteState(p, load_env(project.repo)[1].effective_state_path, remote)
+        state.acquire_lock("deploy-A")
+        lock = f"{state.root}/lock"
+        real_connect = SFTPProvider._connect_once
+
+        def reconnect_after_another_deploy_locked(prov):
+            real_connect(prov)
+            prov._sftp.open(lock, "wx").write(newer.encode())  # it found no lock, took it
+        monkeypatch.setattr(SFTPProvider, "_connect_once", reconnect_after_another_deploy_locked)
+        drop_after(monkeypatch, p, "remove")  # our remove happened; its reply was lost
+        assert state.release_lock() == "changed"
+        monkeypatch.setattr(SFTPProvider, "_connect_once", real_connect)
+        assert p.read_text(lock) == newer  # the other deploy's lock was never deleted
+
+
+def test_lock_takeover_and_unlock_over_sftp(project, ssh_server):
+    from shipr.errors import Aborted, LockedError
+
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n",
+                       extra_env="    confirm: true\n")
+    project.write("a.txt", "a")
+    project.commit()
+    env = load_env(project.repo)[1]
+    lock = f"{env.effective_state_path}/lock"
+    other = '{"deploy_id": "deploy-B", "by": "b@ci", "since": "2026-11-21T10:00:00Z"}'
+    refused = []
+
+    def at_prompt():  # a second deploy is refused; then someone forces the lock over
+        with pytest.raises(LockedError) as e:
+            helpers.deploy(project.repo, yes=True)
+        refused.append(str(e.value))
+        with provider(project) as p:
+            p.delete(lock)
+            assert p.create_exclusive(lock, other)
+    from shipr.ui import UI
+    with pytest.raises(LockedError, match="nothing was changed"):
+        deploy(project, ui=UI(echo=lambda s: None, confirm=lambda m: (at_prompt(), True)[1]))
+    assert "--id " in refused[0]
+    with provider(project) as p:
+        assert p.stat(f"{remote}/a.txt") is None and p.read_text(lock) == other
+    with pytest.raises(LockedError, match="not by deploy deploy-A"):
+        admin.unlock(env, RecordingUI(), "deploy-A")
+    with pytest.raises(Aborted):
+        admin.unlock(env, RecordingUI(answers=[False]))
+    assert admin.unlock(env, RecordingUI(), "deploy-B").startswith("removed lock")
+    assert deploy(project, yes=True).status == "success"

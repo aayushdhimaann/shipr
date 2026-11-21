@@ -478,6 +478,26 @@ class SFTPProvider(Provider):
             sftp.remove(path)
         self._retry(op)
 
+    def delete_if_content(self, path: str, expected: str) -> str:
+        """Every attempt, including one after a reconnect, re-reads the file right before
+        removing it: a retry never deletes a file that someone else wrote in the meantime."""
+        sent = False  # a remove request went out, so its reply may have been lost
+
+        def op(sftp: paramiko.SFTPClient) -> str:
+            nonlocal sent
+            try:
+                if not self._usable(path):
+                    return "deleted" if sent and self._reconnected else "missing"
+                with sftp.open(path, "r") as f:
+                    if f.read().decode("utf-8", "replace") != expected:
+                        return "changed"
+                sent = True
+                sftp.remove(path)
+                return "deleted"
+            except FileNotFoundError:
+                return "missing"  # removed by someone else between the check and our request
+        return self._retry(op)
+
     def rename(self, src: str, dst: str) -> None:
         """Move a regular file; `dst` must not exist. Before moving, the source's size and
         (where the server can run sha256sum) hash are recorded, so that after a lost reply the

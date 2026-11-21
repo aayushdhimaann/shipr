@@ -3,6 +3,7 @@ engine (deploy, rollback) and admin (status, history, unlock, test)."""
 
 from __future__ import annotations
 
+import dataclasses
 import signal
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ import click
 from . import __version__, admin, config, engine, gitops, scaffold, workspace
 from .errors import GitError, ShiprError
 from .models import DeployRecord
+from .state import LockInfo
 from .ui import UI
 
 # 2 is click's usage-error code, so a partial deploy uses 4
@@ -194,7 +196,8 @@ def status(obj: Ctx, env_name) -> None:
     if not m.deployed_commit:
         click.echo(f"{env.name}: nothing deployed by shipr yet ({s.target})")
     else:
-        click.echo(f"{env.name}: {m.deployed_commit[:7]} ({m.branch}) deployed "
+        click.echo(f"{env.name}: {m.deployed_commit[:7]}"
+                   f"{f' ({m.branch})' if m.branch else ''} deployed "
                    f"{m.deployed_at}, {len(m.files)} files tracked")
         target = env.branch or "HEAD"
         try:
@@ -212,7 +215,7 @@ def status(obj: Ctx, env_name) -> None:
         click.echo("warning: remote hooks of the deployed commit have not all run; the next "
                    "deploy runs them")
     if s.lock:
-        click.echo(f"locked: {s.lock}")
+        click.echo(f"locked: {LockInfo.parse(s.lock).describe()}")
     for rel, why in s.drift:
         click.echo(f"  drift  {rel}  ({why})")
     if not s.drift:
@@ -243,15 +246,23 @@ def history(obj: Ctx, env_name, show_id, limit) -> None:
 
 @cli.command()
 @env_option
-@yes_option
+@click.option("--id", "deploy_id", metavar="DEPLOY_ID",
+              help="Remove the lock only if this deploy holds it (no prompt; for scripts).")
+@click.option("--yes", "-y", is_flag=True,
+              help="Not enough on its own: shipr never removes a lock nobody has seen. "
+                   "Use --id.")
 @click.pass_obj
-def unlock(obj: Ctx, env_name, yes) -> None:
-    """Remove a stale deploy lock (only when no deploy is running)."""
+def unlock(obj: Ctx, env_name, deploy_id, yes) -> None:
+    """Remove a stale deploy lock (only when no deploy is running). Shows who holds it
+    first, and removes only that lock."""
     _, env = obj.env(env_name)
-    if not yes and not click.confirm("Only do this if no deploy is running. Remove the lock?"):
-        sys.exit(EXIT_ABORTED)
-    info = admin.unlock(env)
-    click.echo(f"removed lock: {info}" if info else "no lock was held")
+    ui = make_ui()
+    if yes or not sys.stdin.isatty():
+        def show_only(msg: str) -> bool:
+            click.echo(msg.splitlines()[0])
+            return False
+        ui = dataclasses.replace(ui, confirm=show_only)
+    click.echo(admin.unlock(env, ui, deploy_id))
 
 
 def _sigterm(_signum, _frame):

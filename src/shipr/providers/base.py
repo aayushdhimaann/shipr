@@ -154,6 +154,19 @@ class Provider(ABC):
             local.write_text(text, encoding="utf-8")
             self.upload(local, path)
 
+    def delete_if_content(self, path: str, expected: str) -> str:
+        """Delete `path` only if it holds exactly `expected` (the deploy lock): "deleted",
+        "missing" or "changed" (left in place). Not atomic: SFTP has no compare-and-delete, so
+        the check and the delete are two requests. Override to repeat the check right before
+        every retried delete, as the SFTP provider does."""
+        text = self.read_text(path)
+        if text is None:
+            return "missing"
+        if text != expected:
+            return "changed"
+        self.delete(path)
+        return "deleted"
+
     def copy(self, src: str, dst: str) -> None:
         st = self.stat(src)
         with self.local_copy(src) as f:

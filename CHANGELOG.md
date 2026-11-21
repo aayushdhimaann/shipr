@@ -124,7 +124,34 @@
   files) and on each deploy (listing the files in that deploy, such as `.env`, that the built-in
   excludes would have kept back). File names only; what gets uploaded is unchanged.
 
+### Lock and rollback (Phase 3E)
+
+- A deploy only ever removes its own lock. Each lock holds a random token and is compared byte for
+  byte, instead of searching for the deploy id in the lock's text. The SFTP provider re-reads the
+  lock before every delete attempt, so a retry after a lost reply no longer deletes a lock another
+  deploy took meanwhile. A lock removed or taken over while the deploy waited at a prompt stops it
+  before any change; one taken over while it ran is left in place, with a warning to check
+  `shipr status` and `shipr history`.
+- The "another deploy holds the lock" error and `shipr status` show the holder's deploy id, user,
+  machine and age, and the error prints the exact `shipr unlock -e ENV --id ...` command. A lock
+  that can't be released names that command too.
+- `shipr unlock` shows the holder before asking, and removes only the lock it showed. New
+  `--id DEPLOY_ID` removes the lock only if that deploy holds it, without a prompt.
+- `rollback --to` no longer picks one of several commits silently. An exact deploy id wins; a
+  commit prefix must have at least 4 hex digits and match exactly one deployed commit, else the
+  candidates are listed.
+- The history and manifest `branch` is recorded only when the deployed ref is a branch. A commit,
+  a tag, or a rollback used to be recorded as the "branch".
+- New optional `Provider.delete_if_content(path, expected)`; the default works for any provider.
+
 ### Breaking changes
+
+- **`shipr unlock --yes` no longer removes a lock on its own.** It shows the holder and exits 3.
+  Use `shipr unlock --id <deploy id>` in scripts.
+- **`rollback --to` needs at least 4 characters of a commit**, or a deploy id, and refuses a
+  prefix that matches several deployed commits.
+- **`RemoteState.release_lock()` takes no argument**: a `RemoteState` releases only the lock it
+  created.
 
 - **`shipr validate` and every command now reject invalid provider settings and duplicate YAML
   keys** that used to load. Such configs failed on connect (provider settings) or silently used

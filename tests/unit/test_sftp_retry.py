@@ -99,7 +99,7 @@ def test_lock_release_with_lost_reply_is_clean(srv):
     state = RemoteState(p, "/w/.shipr", "/w")
     state.acquire_lock("deploy-1")
     lose_reply(srv, "remove")
-    state.release_lock("deploy-1")  # used to raise: FileNotFoundError on the retry
+    state.release_lock()  # used to raise: FileNotFoundError on the retry
     assert state.read_lock() is None
 
 

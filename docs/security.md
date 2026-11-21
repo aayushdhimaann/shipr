@@ -20,12 +20,18 @@
 | Deleting files that aren't shipr's | Only files recorded in shipr's own manifest can be deleted. Deletion always asks; a non-interactive run needs `--yes`. Deleted files are moved into a backup folder rather than erased. |
 | Overwriting hotfixes made on the server | A file whose size or modified time changed since shipr's last deploy is backed up before it is overwritten. |
 | Half-written files served to visitors | Each upload goes to a temporary file that is then renamed over the target. |
-| Two deploys at once | An exclusive lock file is created on the server for the length of the deploy. A deploy only ever removes its own lock. `kill` (SIGTERM) is handled like Ctrl-C: progress is saved and the lock released. |
+| Two deploys at once | An exclusive lock file is created on the server for the length of the deploy. Each lock holds a random token, so a deploy recognises its own lock byte for byte. A deploy removes only its own lock, re-reading it right before the removal, including on a retry after a lost reply. If the lock was removed or taken over while the deploy waited at a prompt, the deploy stops before changing anything. `shipr unlock` shows the holder first and removes only that exact lock (or the one named with `--id`). Locks never expire. `kill` (SIGTERM) is handled like Ctrl-C: progress is saved and the lock released. |
 | Deploy records exposed on the website | By default records go beside `remote_path`, in its parent folder (`/var/www/html` → `/var/www/.shipr/html`). That is outside the site only when `remote_path` is the web root itself; see "What you must know". The first deploy to the default location and `shipr test` warn about this. Records inside `remote_path` (configured, or left there by shipr 0.1) warn on every deploy and in `shipr status` and `shipr test`. `.htaccess` is written but not relied on: it only works on Apache with `AllowOverride`. |
 | A deploy reported as successful when its records weren't saved | The manifest and the history record are saved separately and checked. If either fails, the deploy exits non-zero, and a manifest that wasn't saved marks the record `failed`. Each record notes whether its files finished, how its hooks went, and whether the manifest was saved. |
 
 ## What you must know
 
+- **The deploy lock is not a compare-and-swap.** SFTP has no atomic "delete if unchanged", so
+  removing a lock is a read followed by a delete. If someone runs `shipr unlock` on a deploy that
+  is still running and a second deploy takes the lock within that one round trip, the first
+  deploy's release could remove the second's lock. Only run `shipr unlock` when no deploy is
+  running. A running deploy checks its lock before its first change and when it finishes, and
+  warns if it was taken over, but not between files.
 - **`shipr.yml` is code.** `build.commands` and `hooks` run through a shell on your machine and on
   the server, the same way `package.json` scripts do. Review changes to `shipr.yml` in pull requests
   the same way you review code. Don't run shipr on repositories you don't trust.
