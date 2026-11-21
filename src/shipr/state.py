@@ -19,6 +19,7 @@ from pydantic import ValidationError
 from .errors import LockedError, StateError
 from .models import DeployRecord, Manifest
 from .providers import Provider
+from .providers.base import is_within
 
 HTACCESS = "# written by shipr: keep deploy records private\nRequire all denied\nDeny from all\n"
 
@@ -42,10 +43,19 @@ def whoami() -> str:
 
 
 class RemoteState:
-    def __init__(self, provider: Provider, state_path: str, inside_webroot: bool):
+    def __init__(self, provider: Provider, state_path: str, remote_path: str,
+                 legacy: bool = False):
         self.provider = provider
         self.root = state_path
-        self.inside_webroot = inside_webroot
+        self.remote_path = remote_path
+        self.legacy = legacy  # found at shipr 0.1's default location, not configured
+        # relative to remote_path when the records sit inside the deploy folder, else None
+        self.rel = state_path[len(remote_path) + 1:] if is_within(state_path, remote_path) \
+            and state_path != remote_path else None
+
+    @property
+    def inside_webroot(self) -> bool:
+        return self.rel is not None
 
     def _path(self, *parts: str) -> str:
         return posixpath.join(self.root, *parts)
@@ -61,6 +71,20 @@ class RemoteState:
         except ValidationError as e:
             raise StateError(f"{path} is corrupt ({e.error_count()} problems); "
                              "fix or remove it, then deploy again") from None
+
+    def check_owner(self, manifest: Manifest, project: str) -> list[str]:
+        """Refuse records that belong to another deploy target (two environments sharing a
+        state dir); return warnings for softer mismatches."""
+        if manifest.remote_path and manifest.remote_path != self.remote_path:
+            raise StateError(
+                f"the deploy records in {self.root} belong to remote_path "
+                f"{manifest.remote_path} (environment {manifest.environment!r}), not "
+                f"{self.remote_path}: two environments share a state directory. Give each "
+                "environment its own state_path.")
+        if manifest.project and manifest.project != project:
+            return [f"the deploy records in {self.root} were written for project "
+                    f"{manifest.project!r}, not {project!r} (renamed project?)"]
+        return []
 
     def save_manifest(self, manifest: Manifest) -> None:
         self.provider.write_text(self._path("manifest.json"),

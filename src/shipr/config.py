@@ -96,7 +96,16 @@ class Environment(BaseModel):
 
     @property
     def effective_state_path(self) -> str:
-        return self.state_path or f"{self.remote_path}/.shipr"
+        """`state_path`, else beside the web root: /var/www/html -> /var/www/.shipr/html."""
+        if self.state_path:
+            return self.state_path
+        parent, name = posixpath.split(self.remote_path)
+        return posixpath.join(parent, ".shipr", name)
+
+    @property
+    def legacy_state_path(self) -> str:
+        """Where shipr 0.1 kept records by default (inside the web root)."""
+        return f"{self.remote_path}/.shipr"
 
     @property
     def state_rel(self) -> str | None:

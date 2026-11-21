@@ -180,8 +180,9 @@ environments:
     provider: sftp               # sftp | local | a plugin
     branch: main                 # what `shipr deploy` deploys by default (default: current HEAD)
     remote_path: /var/www/html   # absolute, normalised path on the server; "/" is refused
-    state_path: null             # where shipr keeps its records (default: <remote_path>/.shipr);
-                                 # a directory of its own: not remote_path or a parent of it
+    state_path: null             # where shipr keeps its records (default: beside the web
+                                 # root, /var/www/html -> /var/www/.shipr/html); a directory of
+                                 # its own: not remote_path or a parent of it
     confirm: false               # ask before deploying (use for production)
     ssh_exec: auto               # auto | true | false: run hooks over SSH?
     sftp:
@@ -253,9 +254,19 @@ Everything lives in `state_path` on the server, so every teammate sees the same 
 .shipr/backups/<id>/...         server copies saved before overwriting or deleting
 ```
 
-If `state_path` is inside `remote_path`, shipr writes a `.htaccess` that denies web access
-(Apache). On nginx, either deny `/.shipr` in the server config or set `state_path` outside the web
-root, for example `/home/deploy/.shipr/my-app`. Backups are never deleted automatically.
+By default these live **beside the web root**, outside it: `remote_path: /var/www/html` keeps
+its records in `/var/www/.shipr/html`, and `/home/u123/public_html` keeps them in
+`/home/u123/.shipr/public_html`. If the deploy user can't create that directory, the deploy
+stops before changing anything and tells you to set `state_path`. Use a writable directory
+outside the web root, for example `/home/deploy/.shipr/my-app`. Backups are never deleted
+automatically.
+
+**Records inside the web root** (`state_path` under `remote_path`, or records left at
+`<remote_path>/.shipr` by shipr 0.1) still work, but shipr warns on every deploy. Anyone who can
+reach that path over HTTP can read the manifest, history and backups, and backed-up scripts may
+still run. A `.htaccess` deny is written, but it only works on Apache with `AllowOverride`. On
+nginx, add `location ^~ /.shipr/ { deny all; }`. To move 0.1 records out, move
+`<remote_path>/.shipr` to the new default location; shipr finds them there on the next deploy.
 
 `state_path` must be a directory of its own. It may not be `remote_path` or one of its parents.
 Two environments on the same server may not share state, nest their state dirs, or keep state
@@ -326,6 +337,11 @@ and failed (!), and who ran it.
 Redeploys an earlier commit through the normal pipeline, so only the files that differ change
 back. Repeated rollbacks keep stepping further back. The commit must exist in your local repo
 (`git fetch` first).
+
+The target comes from the deploy history: every deploy whose files reached the server counts,
+even if a hook failed afterwards. If the last deploy was interrupted, rollback restores the last
+one that completed. If history and the manifest disagree about what is deployed (for example the
+manifest couldn't be saved), rollback refuses to guess and asks for `--to`.
 
 | Option | |
 |---|---|

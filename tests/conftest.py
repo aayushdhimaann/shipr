@@ -43,6 +43,11 @@ class Project:
     def site(self) -> Path:
         return self.server / "site"
 
+    @property
+    def state(self) -> Path:
+        """shipr's records: by default beside the web root, <parent>/.shipr/<name>."""
+        return self.server / ".shipr" / "site"
+
     def remote_files(self) -> set[str]:
         return {p.relative_to(self.site).as_posix() for p in self.site.rglob("*")
                 if p.is_file() and ".shipr" not in p.relative_to(self.site).parts}

@@ -422,12 +422,16 @@ Code: `Deployment._apply finally · _save · run finally · engine.deploy · cli
 flowchart TD
   ok(["status success or partial"]) --> fin
   bad(["exception: error → failed<br/>Ctrl-C or SIGTERM → interrupted"]) --> fin
-  fin["always: set finished time and duration"] --> c{"success or partial?"}
-  c -- yes --> m["manifest: clear in_progress<br/>set deployed_commit, branch, deploy_id, deployed_at"]
+  fin["always: set finished time and duration"] --> c{"files_done?<br/>(every file operation attempted,<br/>even if a hook failed after)"}
+  c -- yes --> m["manifest: clear in_progress<br/>set deployed_commit, branch, deploy_id, deployed_at<br/>hooks_pending if remote_after failed or didn't run"]
   c -- no --> keepip["manifest keeps in_progress<br/>(progress so far is saved)"]
-  m --> sv["save manifest.json and history/ID.json<br/>(a save error only warns; it never hides the real error)"]
+  m --> sv["save manifest.json, then history/ID.json<br/>(record notes files_done, hooks, manifest_saved)"]
   keepip --> sv
-  sv --> res["print result: counts, duration, FAILED lines"]
+  sv --> se{"both saved?"}
+  se -- no --> serr["StateError after the result: exit 1, never 0<br/>(a warning only, when another error is already being reported)"]
+  se -- yes --> res
+  serr --> res
+  res["print result: counts, duration, stages, FAILED lines"]
   res --> rel["release the lock, only if it still names this deploy id"]
   rel --> cls["close the connection · delete the temp export"]
   cls --> la{"success and something changed?"}
@@ -455,7 +459,7 @@ stateDiagram-v2
   Locked --> Unlocked: up to date, or cancelled at a prompt
   Locked --> InProgress: in_progress saved to manifest
   InProgress --> InProgress: checkpoint every 25 files
-  InProgress --> Recorded: success or partial
+  InProgress --> Recorded: files done (hooks may have failed)
   InProgress --> Interrupted: Ctrl-C, kill, lost connection, error
   Recorded --> Unlocked: own lock released
   Interrupted --> Unlocked: own lock released, in_progress kept
@@ -474,8 +478,13 @@ Code: `engine.rollback · rollback_target`
 
 ```mermaid
 flowchart TD
-  s(["shipr rollback -e ENV, optional --to ID or COMMIT"]) --> c["connect · read manifest.deployed_commit<br/>and history (success and partial only)"]
-  c --> t{"--to given?"}
+  s(["shipr rollback -e ENV, optional --to ID or COMMIT"]) --> c["connect · read manifest.deployed_commit<br/>and history (deploys whose files finished)"]
+  c --> ag{"no --to, and the last such deploy<br/>differs from the manifest's commit?"}
+  ag -- yes --> e0["DeployError: history and manifest disagree,<br/>choose with --to"]
+  ag -- no --> ip{"no --to and the last deploy<br/>was interrupted?"}
+  ip -- yes --> lc["the last completed deploy<br/>(undo the half-finished one)"]
+  lc --> h
+  ip -- no --> t{"--to given?"}
   t -- yes --> m["latest deploy whose id matches<br/>or whose commit starts with the value"]
   m -- none --> e1["DeployError: no matching deploy"]
   t -- no --> b["find the deploy that introduced the current commit<br/>(ignoring later rollbacks to it), then take the<br/>latest earlier deploy with a different commit"]
@@ -486,7 +495,7 @@ flowchart TD
   h -- yes --> d["normal deploy of that commit, kind rollback<br/>stages 2 to 6 run unchanged:<br/>only differing files are re-uploaded,<br/>files added since are offered for deletion"]
   classDef err fill:#d23f4520,stroke:#d23f45
   classDef srv fill:#0e8f7f24,stroke:#0e8f7f
-  class e1,e2,e3 err
+  class e0,e1,e2,e3 err
   class c srv
 ```
 
@@ -525,13 +534,13 @@ flowchart TB
 
 Code: `state.RemoteState · models.Manifest · models.DeployRecord`
 
-Everything lives under `state_path`, by default `<remote_path>/.shipr`. Because it is on the server, every teammate and every CI run sees the same state.
+Everything lives under `state_path`, by default beside the web root: `<parent of remote_path>/.shipr/<name of remote_path>`, so `/var/www/html` → `/var/www/.shipr/html`. If that default is empty but `<remote_path>/.shipr/manifest.json` exists (shipr 0.1's default), the old location is used and a warning explains how to move it. Because it is on the server, every teammate and every CI run sees the same state. `manifest.json` also records the `project` and `remote_path` it belongs to. A deploy, `status` or `rollback` whose `remote_path` doesn't match refuses to use it.
 
 ```text
 .shipr/
-├── manifest.json        # files shipr deployed: sha256, size, mtime · deployed_commit · in_progress
+├── manifest.json        # files: sha256, size, mtime · deployed_commit · in_progress · hooks_pending · project, remote_path
 ├── lock                 # present while a deploy runs: user@host, time, deploy id
-├── .htaccess            # deny web access (only when inside the web root)
+├── .htaccess            # deny web access, Apache only (only when inside the web root)
 ├── history/
 │   └── 20261119T103205123Z-3f2a9c1.json   # one record per deploy: who, when, commit, every file, status
 └── backups/

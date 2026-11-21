@@ -238,3 +238,31 @@ def test_guard_works_on_sftp_only_server(project, sftp_only_server, tmp_path):
             p.upload(f, f"{remote}/linked/x.txt")
         assert p.walk(remote)["linked"].kind == "symlink"
         assert p._sftp.listdir(f"{remote}-other") == []
+
+
+# --- state location (Phase 2B: C-3) ------------------------------------------------------------
+def test_default_state_beside_web_root_and_clean_error_when_not_creatable(project, ssh_server):
+    import posixpath
+
+    from shipr.errors import StateError
+
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n")
+    project.write("a.txt", "a")
+    project.commit()
+    deploy(project)
+    parent, name = posixpath.split(remote)
+    with provider(project) as p:
+        assert p.stat(f"{parent}/.shipr/{name}/manifest.json")
+        assert set(p.walk(remote)) == {"a.txt"}  # nothing of shipr's inside the web root
+        locked = f"{parent}/ro-{name}"
+        p.exec(f"mkdir -p {locked}/site && chmod 555 {locked}")
+    cfg = project.repo / "shipr.yml"
+    cfg.write_text(cfg.read_text().replace(remote, f"{locked}/site"))
+    try:
+        with pytest.raises(StateError, match="state_path"):
+            deploy(project)
+        with provider(project) as p:
+            assert p.walk(f"{locked}/site") == {}  # stopped before any change
+    finally:
+        with provider(project) as p:
+            p.exec(f"chmod 755 {locked}")

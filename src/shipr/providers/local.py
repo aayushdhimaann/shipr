@@ -57,7 +57,7 @@ class LocalProvider(Provider):
     def _lkind(self, path: str) -> str | None:
         try:
             return _kind(os.lstat(self._p(path)))
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):  # a parent is missing or is a file
             return None
 
     def _mkdir(self, path: str) -> None:
@@ -97,9 +97,15 @@ class LocalProvider(Provider):
             descend = []
             for name in dirnames + filenames:
                 p = Path(dirpath, name)
-                st = os.lstat(p)
-                kind = _kind(st)
                 rel = p.relative_to(base).as_posix()
+                try:
+                    st = os.lstat(p)
+                except FileNotFoundError:
+                    continue  # deleted since the directory was listed
+                except OSError:  # listable but not inspectable (e.g. a dir with r but no x)
+                    out[rel] = RemoteStat(0, 0, kind="unreadable")
+                    continue
+                kind = _kind(st)
                 if kind == "dir":
                     if p != skip_p:
                         descend.append(name)

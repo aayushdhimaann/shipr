@@ -169,8 +169,10 @@ def rollback(obj: Ctx, env_name, to, dry_run, yes, no_delete) -> None:
 def status(obj: Ctx, env_name) -> None:
     """Show what is deployed and whether the server drifted."""
     cfg, env = obj.env(env_name)
-    s = admin.status(env)
+    s = admin.status(env, cfg.project_name)
     m = s.manifest
+    for w in s.warnings:
+        click.echo(f"warning: {w}")
     if not m.deployed_commit:
         click.echo(f"{env.name}: nothing deployed by shipr yet ({s.target})")
     else:
@@ -183,8 +185,12 @@ def status(obj: Ctx, env_name) -> None:
             click.echo(f"{target} is at {sha[:7]} ({state})")
         except GitError:
             pass  # not in a repo / ref missing locally: the server-side status is still useful
+    click.echo(f"records: {s.state_root}")
     if m.in_progress:
         click.echo(f"warning: interrupted deploy {m.in_progress.deploy_id}")
+    if m.hooks_pending:
+        click.echo("warning: remote hooks of the deployed commit have not all run; the next "
+                   "deploy runs them")
     if s.lock:
         click.echo(f"locked: {s.lock}")
     for rel, why in s.drift:

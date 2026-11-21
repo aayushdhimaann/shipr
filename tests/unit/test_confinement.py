@@ -83,3 +83,75 @@ def test_local_paths_stay_inside_the_local_root(tmp_path):
         with pytest.raises(UnsafePath):
             p._p("/C:/Windows/x")
     assert p._p("/site/a.txt") == tmp_path.resolve() / "site" / "a.txt"
+
+
+# --- LocalProvider classification and walk robustness ------------------------------------------
+def test_reparse_points_are_opaque_on_any_os():
+    from types import SimpleNamespace
+
+    from shipr.providers.local import _kind
+
+    junction = SimpleNamespace(st_mode=0o040755, st_file_attributes=0x400)  # dir + REPARSE_POINT
+    assert _kind(junction) == "symlink"
+    assert _kind(SimpleNamespace(st_mode=0o040755, st_file_attributes=0x10)) == "dir"
+    assert _kind(SimpleNamespace(st_mode=0o100644)) == "file"  # POSIX: no st_file_attributes
+
+
+@pytest.mark.skipif(os.name != "nt", reason="directory junctions are Windows-only")
+def test_windows_junction_is_never_walked_or_written_through(tmp_path):
+    import _winapi
+
+    site, outside = tmp_path / "site", tmp_path / "outside"
+    site.mkdir()
+    outside.mkdir()
+    _winapi.CreateJunction(str(outside), str(site / "storage"))
+    p = LocalProvider({"root": str(tmp_path)})
+    p.connect()
+    p.roots = ("/site",)
+    assert p.walk("/site")["storage"].kind == "symlink"
+    src = tmp_path / "f.txt"
+    src.write_text("x")
+    with pytest.raises(UnsafePath, match="symlink"):
+        p.upload(src, "/site/storage/f.txt")
+    assert list(outside.iterdir()) == []
+
+
+def test_local_walk_survives_entries_that_vanish_or_cannot_be_inspected(tmp_path, monkeypatch):
+    import shipr.providers.local as local_mod
+
+    site = tmp_path / "site"
+    site.mkdir()
+    for name in ("keep.txt", "gone.txt", "secret.txt"):
+        (site / name).write_text(name)
+    real_lstat = os.lstat
+
+    def flaky_lstat(path, *a, **k):
+        name = os.path.basename(path)
+        if name == "gone.txt":
+            raise FileNotFoundError(2, "No such file", str(path))  # deleted mid-walk
+        if name == "secret.txt":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_lstat(path, *a, **k)
+
+    monkeypatch.setattr(local_mod.os, "lstat", flaky_lstat)
+    p = LocalProvider({"root": str(tmp_path)})
+    p.connect()
+    got = p.walk("/site")
+    assert got["keep.txt"].kind == "file"
+    assert "gone.txt" not in got
+    assert got["secret.txt"].kind == "unreadable"
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions, non-root")
+def test_local_walk_handles_listable_but_unsearchable_dir(tmp_path):
+    d = tmp_path / "site" / "half"
+    d.mkdir(parents=True)
+    (d / "f.txt").write_text("f")
+    d.chmod(0o444)  # can list names, cannot lstat them
+    try:
+        p = LocalProvider({"root": str(tmp_path)})
+        p.connect()
+        got = p.walk("/site")
+    finally:
+        d.chmod(0o755)
+    assert got["half/f.txt"].kind == "unreadable"

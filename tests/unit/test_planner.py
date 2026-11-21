@@ -126,3 +126,22 @@ def test_opaque_entries_are_not_adopted_or_hashed():
     make_plan({"x": lf("a")}, {}, {"x": opaque("symlink")}, Rules(Files()),
               lambda rels: asked.extend(rels) or {})
     assert asked == []
+
+
+# --- recovering an interrupted deploy (C-22) ---------------------------------------------------
+def test_recovery_hash_checks_stat_mismatches_before_calling_them_hotfixes():
+    p = make_plan(
+        {"ours": lf("new"), "touched": lf("new"), "touched_same": lf("a"), "hotfix": lf("new")},
+        {"ours": m("old"), "touched": m("old"), "touched_same": m("a"), "hotfix": m("old")},
+        {r: rs(mtime=999) for r in ("ours", "touched", "touched_same", "hotfix")},
+        Rules(Files()),
+        lambda rels: {"ours": "new", "touched": "old", "touched_same": "a", "hotfix": "edited"},
+        recovering=True)
+    assert reasons(p) == {"touched": ("changed", False),
+                          "hotfix": ("changed on server since last deploy", True)}
+    assert p.adopt == {"ours": "new", "touched_same": "a"}
+
+
+def test_without_recovery_stat_mismatch_is_still_a_hotfix():
+    p = plan({"x": lf("new")}, {"x": m("old")}, {"x": rs(mtime=999)}, hashes={"x": "new"})
+    assert reasons(p) == {"x": ("changed on server since last deploy", True)}

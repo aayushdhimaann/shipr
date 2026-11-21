@@ -7,12 +7,13 @@ success/failure bookkeeping.
 from __future__ import annotations
 
 import dataclasses
+import posixpath
 import time
 from dataclasses import dataclass
 
 from . import gitops, providers
 from .config import Config, Environment
-from .errors import Aborted, DeployError, ProviderError, UnsafePath
+from .errors import Aborted, DeployError, ProviderError, StateError, UnsafePath
 from .executor import PlanExecutor
 from .hooks import remote_exec_available, run_local, run_remote_phase
 from .models import DeployRecord, InProgress, Kind, Manifest
@@ -41,8 +42,29 @@ def open_provider(env: Environment, trust_new_host: bool = False) -> Provider:
 
 
 def state_for(env: Environment, provider: Provider) -> RemoteState:
-    return RemoteState(provider, env.effective_state_path,
-                       inside_webroot=env.state_rel is not None)
+    """The environment's records: `state_path`, else the default beside the web root. Records
+    already at shipr 0.1's default (inside the web root) keep being used until moved."""
+    root, legacy = env.effective_state_path, False
+    if env.state_path is None \
+            and provider.stat(posixpath.join(root, "manifest.json")) is None \
+            and provider.stat(posixpath.join(env.legacy_state_path, "manifest.json")):
+        root, legacy = env.legacy_state_path, True
+    return RemoteState(provider, root, env.remote_path, legacy)
+
+
+def state_warnings(env: Environment, state: RemoteState) -> list[str]:
+    if state.legacy:
+        return [f"deploy records are in {state.root}, inside the web root (shipr 0.1's "
+                "default): anyone who can reach it over HTTP can read the manifest, history "
+                "and backups, and backed-up scripts may still run. Move that folder to "
+                f"{env.effective_state_path} (shipr then finds it there), or set "
+                f"`state_path: {state.root}` to keep it where it is."]
+    if state.inside_webroot:
+        return [f"state_path {state.root} is inside the web root: deploy records and backups "
+                "(including old scripts) are reachable over HTTP unless your web server denies "
+                "that path. .htaccess only helps on Apache with AllowOverride; see "
+                "docs/security.md."]
+    return []
 
 
 def scan_remote(env: Environment, provider: Provider, state: RemoteState) -> dict[str, RemoteStat]:
@@ -68,7 +90,9 @@ class Deployment:
     def __init__(self, cfg: Config, env: Environment, provider: Provider, ws: Workspace,
                  options: DeployOptions, ui: UI):
         self.env, self.provider, self.ws, self.options, self.ui = env, provider, ws, options, ui
+        self.project = cfg.project_name
         self.state = state_for(env, provider)
+        self._save_error: str | None = None
         self.record = DeployRecord(
             id=new_deploy_id(ws.sha), kind=options.kind, project=cfg.project_name,
             environment=env.name, commit=ws.sha, branch=ws.branch, subject=ws.subject,
@@ -76,23 +100,27 @@ class Deployment:
         self._leftovers: list[str] = []  # shipr's own leftovers, safe to remove after the run
 
     def run(self) -> DeployRecord:
+        for w in state_warnings(self.env, self.state):
+            self.ui.warn(w)
         if self.options.dry_run:  # read-only: no lock, no writes
             self._load_and_plan()
             self.record.status = "dry-run"
             self.ui.echo("dry run: nothing was changed")
             return self.record
 
-        self.state.acquire_lock(self.record.id)
+        self._lock()
         try:
             manifest, remote, plan = self._load_and_plan()
             if plan.empty and manifest.deployed_commit == self.ws.sha \
-                    and not manifest.in_progress:
+                    and not manifest.in_progress and not manifest.hooks_pending:
                 self.record.status = "up-to-date"
                 self.ui.echo("already up to date")
                 return self.record
             deletes = self._confirm(plan)
             self._apply(manifest, remote, plan, deletes)
             show_result(self.ui, self.record)
+            if self._save_error:
+                raise StateError(self._save_error)
             return self.record
         finally:
             try:
@@ -101,13 +129,32 @@ class Deployment:
                 self.ui.warn(f"could not release lock: {e} (run `shipr unlock`)")
 
     # steps -------------------------------------------------------------------
+    def _lock(self) -> None:
+        """Take the deploy lock; creating it also creates the state dir, so a state dir the
+        deploy user can't create is reported here, before anything changes."""
+        try:
+            self.state.acquire_lock(self.record.id)
+        except (OSError, ProviderError) as e:
+            env = self.env
+            fix = (f"By default shipr keeps them beside the web root. Set `state_path` in "
+                   "shipr.yml to a directory the deploy user can write outside the web root "
+                   f"(e.g. /home/<user>/.shipr/{posixpath.basename(env.remote_path)}), or to "
+                   f"{env.legacy_state_path} to keep them inside the web root (shipr warns on "
+                   "every deploy)." if env.state_path is None
+                   else "Check that the deploy user can create and write it.")
+            raise StateError(f"cannot create shipr's deploy records in {self.state.root} "
+                             f"({e}). {fix}") from None
+
     def _load_and_plan(self) -> tuple[Manifest, dict[str, RemoteStat], Plan]:
         manifest = self.state.load_manifest()
+        for w in self.state.check_owner(manifest, self.project):
+            self.ui.warn(w)
         self._warn_about(manifest)
         remote = scan_remote(self.env, self.provider, self.state)
         self._leftovers = self._own_leftovers(manifest, remote)
         plan = make_plan(self.ws.files, manifest.files, remote, self.ws.rules,
-                         self._remote_hashes, reserved=self.env.state_rel)
+                         self._remote_hashes, reserved=self.state.rel,
+                         recovering=manifest.in_progress is not None)
         show_plan(self.ui, plan, self.ws.renames_since(manifest.deployed_commit))
         if plan.blocked:
             self.record.blocked = [rel for rel, _ in plan.blocked]
@@ -197,27 +244,41 @@ class Deployment:
 
     def _apply(self, manifest: Manifest, remote: dict[str, RemoteStat], plan: Plan,
                deletes: list[Op]) -> None:
+        """Hooks, file operations and records, each stage noted on the record. Everything
+        from the first remote hook on is recorded in history, whatever happens."""
         env, record = self.env, self.record
+        manifest.project, manifest.remote_path = self.project, env.remote_path
+        manifest.environment = env.name
         has_remote_hooks = bool(env.hooks.remote_before or env.hooks.remote_after)
-        can_exec = has_remote_hooks and remote_exec_available(env, self.provider)
-        run_remote_phase(self.provider, env, env.hooks.remote_before, "remote_before", can_exec,
-                         self.ui)
-
-        self.state.ensure_private()
-        manifest.in_progress = InProgress(deploy_id=record.id, by=record.by,
-                                          started=record.started)
-        self.state.save_manifest(manifest)
         t0 = time.monotonic()
+        failed = True
         try:
+            can_exec = has_remote_hooks and remote_exec_available(env, self.provider)
+            if has_remote_hooks:
+                record.hooks = "not-run" if can_exec else "skipped"
+            self._hooks(env.hooks.remote_before, "remote_before", can_exec)
+
+            manifest.in_progress = InProgress(deploy_id=record.id, by=record.by,
+                                              started=record.started)
+            try:
+                self.state.ensure_private()
+                self.state.save_manifest(manifest)  # before any file changes
+            except (OSError, ProviderError) as e:
+                raise StateError(f"cannot write deploy records to {self.state.root} ({e}); "
+                                 "nothing on the server was changed") from None
             PlanExecutor(self.provider, self.state, manifest, record, self.ws.files, remote,
                          env.remote_path, self.ui).run(plan, deletes)
+            record.files_done = True
             self._remove_leftovers()
             record.status = "partial" if record.failed else "success"
             if record.failed and env.hooks.remote_after:
-                self.ui.warn("some files failed; remote_after hooks skipped")
+                self.ui.warn("some files failed; remote_after hooks skipped (they run on the "
+                             "next deploy)")
             else:
-                run_remote_phase(self.provider, env, env.hooks.remote_after, "remote_after",
-                                 can_exec, self.ui)
+                self._hooks(env.hooks.remote_after, "remote_after", can_exec)
+                if can_exec:
+                    record.hooks = "ok"
+            failed = False
         except BaseException as e:
             record.status = "interrupted" if isinstance(e, KeyboardInterrupt) else "failed"
             record.error = str(e) or type(e).__name__
@@ -225,7 +286,16 @@ class Deployment:
         finally:
             record.finished = now_iso()
             record.duration_s = round(time.monotonic() - t0, 2)
-            self._save(manifest)
+            self._save_error = self._save(manifest)
+            if self._save_error and failed:  # don't hide the original error
+                self.ui.warn(self._save_error)
+
+    def _hooks(self, commands: list[str], phase: str, can_exec: bool) -> None:
+        try:
+            run_remote_phase(self.provider, self.env, commands, phase, can_exec, self.ui)
+        except BaseException:
+            self.record.hooks = "failed"
+            raise
 
     def _remove_leftovers(self) -> None:
         for rel in self._leftovers:
@@ -235,31 +305,65 @@ class Deployment:
             except (OSError, ProviderError, UnsafePath):
                 pass  # verified leftovers; retried next deploy
 
-    def _save(self, manifest: Manifest) -> None:
-        """Persist progress whatever happened; an interrupted run keeps `in_progress`."""
+    def _save(self, manifest: Manifest) -> str | None:
+        """Persist the manifest, then the history record, whatever happened. The manifest
+        names the deployed commit as soon as its files are on the server, even if a hook then
+        failed; an interrupted run keeps `in_progress`. Returns a message if anything could
+        not be saved: such a deploy never exits 0."""
         record = self.record
-        if record.completed:
+        if record.files_done:
             manifest.in_progress = None
             manifest.deployed_commit = record.commit
             manifest.branch = record.branch
             manifest.deploy_id = record.id
             manifest.deployed_at = record.finished
-            manifest.environment = record.environment
+            manifest.hooks_pending = record.hooks in ("not-run", "failed")
+        problems = []
         try:
             self.state.save_manifest(manifest)
+            record.manifest_saved = True
+        except Exception as e:
+            problems.append(f"manifest: {e}")
+            if record.status in ("success", "partial"):
+                record.status = "failed"
+                record.error = f"the manifest could not be saved: {e}"
+        try:
             self.state.save_history(record)
-        except Exception as e:  # don't hide the original error
-            self.ui.warn(f"could not save deploy records: {e}")
+        except Exception as e:
+            problems.append(f"history: {e}")
+        if not problems:
+            return None
+        return (f"deploy records could not be saved ({'; '.join(problems)}). The server may "
+                "not match shipr's records: check `shipr status`, then deploy again once "
+                f"{self.state.root} accepts writes.")
 
 
 def rollback(cfg: Config, env: Environment, to: str | None = None,
              options: DeployOptions | None = None, ui: UI | None = None) -> DeployRecord:
-    """Redeploy an earlier commit; the normal diff then reverts exactly the changed files."""
+    """Redeploy an earlier commit; the normal diff then reverts exactly the changed files.
+    The target comes from history (deploys whose files reached the server), cross-checked
+    against the manifest; when they disagree, the user picks explicitly."""
+    ui = ui or UI()
     with open_provider(env) as provider:
         state = state_for(env, provider)
-        current = state.load_manifest().deployed_commit
+        manifest = state.load_manifest()
+        for w in state.check_owner(manifest, cfg.project_name):
+            ui.warn(w)
         records = [r for r in state.list_history() if r.completed]
-    target = rollback_target(records, current, to)
+    current = manifest.deployed_commit
+    if not to and records and current and records[-1].commit != current:
+        last = records[-1]
+        raise DeployError(
+            "shipr's history and manifest disagree about what is deployed: the last deploy "
+            f"that reached the server ({last.id}) put {last.commit[:7]} there, but the manifest "
+            f"records {current[:7]}. Choose the version to restore with --to <deploy id> "
+            "(see `shipr history`).")
+    interrupted = manifest.in_progress is not None
+    target = rollback_target(records, current, to, interrupted=interrupted)
+    ui.echo(f"rolling back {env.name} from {(current or '?')[:7]} to {target.commit[:7]} "
+            f"(deploy {target.id})"
+            + ("; the last deploy was interrupted, so this restores the last one that "
+               "completed" if interrupted and not to else ""))
     if not gitops.has_commit(target.commit, gitops.repo_root(cfg.dir)):
         raise DeployError(f"commit {target.commit[:7]} is not in your local repo; "
                           "run git fetch first")
@@ -268,7 +372,14 @@ def rollback(cfg: Config, env: Environment, to: str | None = None,
 
 
 def rollback_target(records: list[DeployRecord], current: str | None,
-                    to: str | None) -> DeployRecord:
+                    to: str | None, interrupted: bool = False) -> DeployRecord:
+    if interrupted and not to:
+        # the server holds a mix: undo the interrupted deploy, back to the last completed one
+        same = [r for r in records if r.commit == current]
+        if not same:
+            raise DeployError("the last deploy was interrupted and no completed deploy is "
+                              "recorded; choose one with --to (see `shipr history`)")
+        return same[-1]
     if to:
         matches = [r for r in records if r.id == to or r.commit.startswith(to)]
         if not matches:

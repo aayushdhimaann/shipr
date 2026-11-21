@@ -17,7 +17,7 @@ def run(project, ui=None, **opts):
 
 
 def manifest(project):
-    return json.loads((project.site / ".shipr" / "manifest.json").read_text())
+    return json.loads((project.state / "manifest.json").read_text())
 
 
 def test_full_then_incremental(project):
@@ -29,7 +29,7 @@ def test_full_then_incremental(project):
     assert rec.status == "success"
     assert project.remote_files() == {"index.php", "css/app.css"}  # .env never uploaded
     assert manifest(project)["deployed_commit"] == sha
-    assert (project.site / ".shipr" / ".htaccess").exists()
+    assert not (project.site / ".shipr").exists()  # records live outside the web root
 
     project.write("index.php", "v2")
     project.commit()
@@ -124,8 +124,8 @@ def test_first_deploy_over_existing_site_adopts_identical_files(project):
 def test_lock_blocks_concurrent_deploy(project):
     project.write("a.txt", "a")
     project.commit()
-    (project.site / ".shipr").mkdir(parents=True)
-    (project.site / ".shipr" / "lock").write_text('{"by": "someone"}')
+    project.state.mkdir(parents=True)
+    (project.state / "lock").write_text('{"by": "someone"}')
     with pytest.raises(LockedError, match="someone"):
         run(project)
 
@@ -151,7 +151,7 @@ def test_interrupted_deploy_recovers(project, monkeypatch):
         run(project)
     m = manifest(project)
     assert m.get("in_progress") and len(m["files"]) == 26  # progress saved
-    assert not (project.site / ".shipr" / "lock").exists()  # lock released
+    assert not (project.state / "lock").exists()  # lock released
 
     monkeypatch.setattr(LocalProvider, "upload", real)
     ui = RecordingUI()
@@ -265,7 +265,7 @@ def test_lock_release_only_removes_own_lock(project):
     from shipr.state import RemoteState
 
     with LocalProvider({"root": str(project.server)}) as p:
-        st = RemoteState(p, "/site/.shipr", inside_webroot=True)
+        st = RemoteState(p, "/site/.shipr", "/site")
         st.acquire_lock("deploy-1")
         st.release_lock("deploy-2")  # someone else's id: must not remove it
         assert st.read_lock() and "deploy-1" in st.read_lock()
@@ -452,7 +452,7 @@ def test_unproven_park_stops_the_deploy_before_any_change(project, dst_state):
         run(project)
     assert p.read_text() == "server-side edit nobody backed up"
     assert manifest(project) == before
-    assert not (project.site / ".shipr" / "lock").exists()
+    assert not (project.state / "lock").exists()
 
 
 def test_park_matching_a_backup_is_removed(project):
@@ -479,3 +479,260 @@ def test_legacy_park_name_matching_manifest_is_removed(project):
     project.commit()
     run(project)
     assert not legacy.exists()
+
+
+# --- state location and consistency (Phase 2B: C-3, C-5, C-6, C-9, C-22, C-23) ------------------
+from shipr.errors import StateError  # noqa: E402
+from shipr.state import RemoteState as _RemoteState  # noqa: E402
+
+
+def history_records(project):
+    return [json.loads(p.read_text()) for p in sorted((project.state / "history").iterdir())]
+
+
+def test_default_records_live_beside_the_web_root(project):
+    project.write("a.txt", "a")
+    project.commit()
+    ui = RecordingUI()
+    run(project, ui=ui)
+    assert (project.state / "manifest.json").exists()
+    assert not (project.site / ".shipr").exists() and "web root" not in ui.text
+
+
+def test_legacy_in_root_records_keep_working_with_a_warning(project):
+    project.write("a.txt", "a")
+    project.commit()
+    add_env_option(project, "state_path: /site/.shipr")  # what 0.1 did by default
+    run(project)
+    project.write_config()  # back to the default: no state_path
+    project.write("a.txt", "a2")
+    project.commit()
+    ui = RecordingUI()
+    rec = run(project, ui=ui)
+    assert [u.path for u in rec.uploaded] == ["a.txt"]  # incremental: old records were used
+    assert (project.site / ".shipr" / "manifest.json").exists() and not project.state.exists()
+    assert "inside the web root" in ui.text and "/.shipr/site" in ui.text  # where to move them
+
+
+def test_explicit_in_root_state_warns_every_deploy(project):
+    project.write("a.txt", "a")
+    project.commit()
+    add_env_option(project, "state_path: /site/.shipr")
+    for _ in range(2):
+        project.write("a.txt", project.repo.joinpath("a.txt").read_text() + "!")
+        project.commit()
+        ui = RecordingUI()
+        run(project, ui=ui)
+        assert "inside the web root" in ui.text
+
+
+def test_uncreatable_default_state_dir_stops_before_any_change(project):
+    project.write("a.txt", "a")
+    project.commit()
+    (project.server / ".shipr").write_text("not a directory")  # deploy user can't create it
+    with pytest.raises(StateError, match="state_path"):
+        run(project)
+    assert not project.site.exists()
+
+
+def deploy_a_b_then_c_with_failing_hook(project):
+    project.write("v.txt", "A")
+    project.commit()
+    run(project)
+    project.write("v.txt", "B")
+    b = project.commit()
+    run(project)
+    project.write_config("hooks:\n  remote_after: ['exit 1']\n")
+    project.write("v.txt", "C")
+    c = project.commit()
+    with pytest.raises(DeployError, match="remote command failed"):
+        run(project)
+    return b, c
+
+
+def test_hook_failure_keeps_records_truthful_and_rollback_correct(project):
+    """C-6: before, the manifest kept B while the server had C, and rollback skipped to A."""
+    b, c = deploy_a_b_then_c_with_failing_hook(project)
+    m = manifest(project)
+    assert (project.site / "v.txt").read_text() == "C"
+    assert m["deployed_commit"] == c and "in_progress" not in m and m["hooks_pending"]
+    last = history_records(project)[-1]
+    assert (last["status"], last["files_done"], last["hooks"]) == ("failed", True, "failed")
+    project.write_config()  # drop the broken hook (not committed: rollback uses this config)
+    cfg, env = load_env(project.repo)
+    ui = RecordingUI()
+    rec = engine.rollback(cfg, env, options=engine.DeployOptions(yes=True), ui=ui)
+    assert rec.commit == b and (project.site / "v.txt").read_text() == "B"
+    assert f"from {c[:7]} to {b[:7]}" in ui.text
+
+
+def test_failed_hooks_run_again_on_the_next_deploy(project):
+    deploy_a_b_then_c_with_failing_hook(project)
+    project.write_config("hooks:\n  remote_after: ['echo ran > hook.txt']\n")
+    rec = run(project)  # same commit, same files: only the pending hooks to do
+    assert rec.status == "success" and rec.hooks == "ok" and not rec.uploaded
+    assert (project.site / "hook.txt").exists() and not manifest(project).get("hooks_pending")
+    assert run(project).status == "up-to-date"
+
+
+def test_remote_before_failure_is_recorded(project):
+    project.write_config("hooks:\n  remote_before: ['exit 3']\n")
+    project.write("a.txt", "a")
+    project.commit()
+    project.site.mkdir(parents=True)
+    with pytest.raises(DeployError):
+        run(project)
+    last = history_records(project)[-1]
+    assert (last["status"], last["files_done"], last["hooks"]) == ("failed", False, "failed")
+    assert not (project.site / "a.txt").exists()
+
+
+@pytest.mark.parametrize("broken", ["save_history", "save_manifest"])
+def test_unsaved_records_are_never_reported_as_success(project, monkeypatch, broken):
+    project.write("a.txt", "a")
+    project.commit()
+
+    real = getattr(_RemoteState, broken)
+    calls = {"n": 0}
+
+    def fail_final_save(self, *a):  # the manifest is saved once before any file changes
+        calls["n"] += 1
+        if broken == "save_manifest" and calls["n"] == 1:
+            return real(self, *a)
+        raise OSError("disk quota exceeded")
+    monkeypatch.setattr(_RemoteState, broken, fail_final_save)
+    with pytest.raises(StateError, match="could not be saved"):
+        run(project)
+    assert (project.site / "a.txt").exists()  # the files did go out
+    if broken == "save_manifest":
+        last = history_records(project)[-1]
+        assert last["status"] == "failed" and last["manifest_saved"] is False
+
+
+def test_unsaved_records_exit_nonzero_on_the_cli(project, monkeypatch):
+    from click.testing import CliRunner
+
+    from shipr.cli import cli
+    monkeypatch.chdir(project.repo)
+    project.write("a.txt", "a")
+    project.commit()
+    monkeypatch.setattr(_RemoteState, "save_history",
+                        lambda self, r: (_ for _ in ()).throw(OSError("disk full")))
+    r = CliRunner().invoke(cli, ["deploy"])
+    assert r.exit_code == 1 and "could not be saved" in r.output
+
+
+def test_records_of_another_deploy_target_are_refused(project):
+    """C-5: prod and staging pointed at one state dir (bypassing config validation)."""
+    project.write("a.txt", "a")
+    project.write("old.txt", "old")
+    project.commit()
+    cfg_text = (project.repo / "shipr.yml").read_text()
+    (project.repo / "shipr.yml").write_text(
+        cfg_text + "    state_path: /state\n  staging:\n    remote_path: /staging\n"
+        "    state_path: /state\n")
+    from shipr import config
+    cfg = config.load(project.repo / "shipr.yml")
+    opts = engine.DeployOptions(yes=True)
+    engine.deploy(cfg, cfg.env("prod"), None, opts, RecordingUI())
+    with pytest.raises(StateError, match="belong to remote_path /site"):
+        engine.deploy(cfg, cfg.env("staging"), None, opts, RecordingUI())
+
+
+def test_records_unwritable_before_any_change_is_a_clean_error(project, monkeypatch):
+    project.write("a.txt", "a")
+    project.commit()
+    monkeypatch.setattr(_RemoteState, "save_manifest",
+                        lambda self, m: (_ for _ in ()).throw(OSError("read-only filesystem")))
+    with pytest.raises(StateError, match="nothing on the server was changed"):
+        run(project)
+    assert not (project.site / "a.txt").exists()
+
+
+def test_crash_between_checkpoints_does_not_fake_hotfixes(project, monkeypatch):
+    """C-22: a hard crash loses up to 24 manifest updates; they must not become 'hotfixes'."""
+    for i in range(30):
+        project.write(f"f{i:02}.txt", "1")
+    project.commit()
+    run(project)
+    for i in range(30):
+        project.write(f"f{i:02}.txt", "22")  # different size: the stat surely changes
+    project.commit()
+    from shipr.providers.local import LocalProvider
+
+    real = LocalProvider.upload
+    n = {"site": 0}
+
+    def crash(self, local, remote, mode=None):
+        if "/.shipr/" not in remote:
+            n["site"] += 1
+            if n["site"] == 28:
+                raise SystemExit("power cut")  # no graceful save after this
+        return real(self, local, remote, mode)
+    monkeypatch.setattr(LocalProvider, "upload", crash)
+    monkeypatch.setattr(engine.Deployment, "_save", lambda self, m: None)
+    with pytest.raises(SystemExit):
+        run(project)
+    monkeypatch.undo()
+    rec = run(project)
+    assert rec.status == "success"
+    assert not [u for u in rec.uploaded if u.backup]  # shipr's own uploads aren't hotfixes
+    assert sorted(u.path for u in rec.uploaded) == [f"f{i:02}.txt" for i in range(27, 30)]
+
+
+def test_rollback_refuses_when_history_and_manifest_disagree(project, monkeypatch):
+    for v in ("A", "B"):
+        project.write("v.txt", v)
+        project.commit()
+        run(project)
+    project.write("v.txt", "C")
+    project.commit()
+    real = _RemoteState.save_manifest
+    calls = {"n": 0}
+
+    def final_save_fails(self, m):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise OSError("disk full")
+        real(self, m)
+    monkeypatch.setattr(_RemoteState, "save_manifest", final_save_fails)
+    with pytest.raises(StateError):
+        run(project)  # files of C are out; history says so, the manifest doesn't
+    monkeypatch.undo()
+    cfg, env = load_env(project.repo)
+    with pytest.raises(DeployError, match="disagree"):
+        engine.rollback(cfg, env, options=engine.DeployOptions(yes=True), ui=RecordingUI())
+    first = admin.history(env)[0]
+    rec = engine.rollback(cfg, env, to=first.id, options=engine.DeployOptions(yes=True),
+                          ui=RecordingUI())
+    assert rec.commit == first.commit and (project.site / "v.txt").read_text() == "A"
+
+
+def test_rollback_after_interrupted_deploy_restores_last_completed(project, monkeypatch):
+    project.write("v.txt", "A")
+    project.commit()
+    run(project)
+    project.write("v.txt", "B")
+    b = project.commit()
+    run(project)
+    for i in range(3):
+        project.write(f"n{i}.txt", "n")
+    project.write("v.txt", "C")
+    project.commit()
+    from shipr.providers.local import LocalProvider
+
+    real = LocalProvider.upload
+
+    def interrupt(self, local, remote, mode=None):
+        if remote.endswith("n2.txt"):
+            raise KeyboardInterrupt
+        return real(self, local, remote, mode)
+    monkeypatch.setattr(LocalProvider, "upload", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        run(project)
+    monkeypatch.undo()
+    cfg, env = load_env(project.repo)
+    ui = RecordingUI()
+    rec = engine.rollback(cfg, env, options=engine.DeployOptions(yes=True), ui=ui)
+    assert rec.commit == b and "interrupted" in ui.text
+    assert (project.site / "v.txt").read_text() == "B" and not (project.site / "n0.txt").exists()

@@ -41,5 +41,7 @@ def show_plan(ui: UI, plan: Plan, renames: dict[str, str]) -> None:
 def show_result(ui: UI, record: DeployRecord) -> None:
     ui.echo(f"{record.status}: {len(record.uploaded)} uploaded, {len(record.deleted)} deleted, "
             f"{len(record.failed)} failed in {record.duration_s}s (deploy id {record.id})")
+    ui.echo(f"  files: {'done' if record.files_done else 'NOT finished'} · hooks: "
+            f"{record.hooks} · manifest: {'saved' if record.manifest_saved else 'NOT saved'}")
     for f in record.failed:
         ui.echo(f"  FAILED {f.path}: {f.error}")

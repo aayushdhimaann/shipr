@@ -9,6 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 Status = Literal["success", "partial", "failed", "interrupted", "dry-run", "up-to-date"]
 Kind = Literal["deploy", "rollback"]
+# remote hooks of a deploy: none configured, all ran, skipped by ssh_exec policy / no shell,
+# one failed, or not run (deploy stopped first, or files failed)
+HookState = Literal["none", "ok", "skipped", "failed", "not-run"]
 
 
 class _Record(BaseModel):
@@ -38,6 +41,11 @@ class Manifest(_Record):
     deploy_id: str | None = None
     deployed_at: str | None = None
     in_progress: InProgress | None = None
+    # which deploy target these records belong to (absent in manifests from shipr 0.1)
+    project: str | None = None
+    remote_path: str | None = None
+    # files of deployed_commit are on the server but its remote hooks haven't all run yet
+    hooks_pending: bool = False
 
 
 class UploadedFile(_Record):
@@ -81,6 +89,10 @@ class DeployRecord(_Record):
     blocked: list[str] = Field(default_factory=list)
     # shipr's own leftovers from interrupted uploads that were verified and removed
     cleaned: list[str] = Field(default_factory=list)
+    # stages, so `status` never hides which part of a deploy did or didn't happen
+    files_done: bool = False  # every planned file operation was attempted (some may have failed)
+    hooks: HookState = "none"
+    manifest_saved: bool = False  # (history itself: a deploy whose history failed exits non-zero)
 
     @property
     def changed(self) -> bool:
@@ -88,5 +100,6 @@ class DeployRecord(_Record):
 
     @property
     def completed(self) -> bool:
-        """Finished its file operations (some may have failed): the server reflects it."""
-        return self.status in ("success", "partial")
+        """Finished its file operations (some may have failed): the server reflects it, even
+        if a hook failed afterwards. Records from shipr 0.1 have no `files_done`."""
+        return self.files_done or self.status in ("success", "partial")

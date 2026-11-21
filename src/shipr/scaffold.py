@@ -38,6 +38,9 @@ environments:
     branch: main
     confirm: true
     remote_path: /var/www/html
+    # deploy records default to /var/www/.shipr/html (beside the web root). If the deploy user
+    # can't create that, point state_path at a writable folder outside the web root:
+    # state_path: /home/deploy/.shipr/production
     sftp:
       host: example.com
 """

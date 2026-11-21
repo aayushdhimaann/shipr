@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import posixpath
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .config import Environment
-from .engine import open_provider, scan_remote, state_for
+from .engine import open_provider, scan_remote, state_for, state_warnings
 from .errors import DeployError, ProviderError
 from .hooks import remote_exec_available
 from .models import DeployRecord, Manifest
@@ -20,12 +20,15 @@ class Status:
     drift: list[tuple[str, str]]  # (path, why)
     lock: str | None
     target: str
+    state_root: str = ""
+    warnings: list[str] = field(default_factory=list)
 
 
-def status(env: Environment) -> Status:
+def status(env: Environment, project: str) -> Status:
     with open_provider(env) as provider:
         state = state_for(env, provider)
         manifest = state.load_manifest()
+        warnings = state.check_owner(manifest, project) + state_warnings(env, state)
         remote = scan_remote(env, provider, state)
         opaque = {rel: r.kind for rel, r in remote.items() if r.kind != "file"}
         drift = []
@@ -38,7 +41,8 @@ def status(env: Environment) -> Status:
                 drift.append((rel, "missing on server"))
             elif not stat_matches(entry, r):
                 drift.append((rel, "changed on server"))
-        return Status(manifest, drift, state.read_lock(), provider.describe())
+        return Status(manifest, drift, state.read_lock(), provider.describe(), state.root,
+                      warnings)
 
 
 def history(env: Environment) -> list[DeployRecord]:
@@ -85,8 +89,6 @@ def check_connection(env: Environment, trust: bool, ui: UI) -> bool:
             ui.echo(str(e))
             return False
         ui.echo("shell commands: " + ("available" if can else "not available (hooks skipped)"))
-        if state.inside_webroot:
-            ui.echo(f"note: deploy records live inside the web root ({state.root}); shipr blocks "
-                    "them for Apache via .htaccess. On nginx, deny it or set `state_path` "
-                    "outside the web root.")
+        for w in state_warnings(env, state):
+            ui.echo(f"warning: {w}")
         return True

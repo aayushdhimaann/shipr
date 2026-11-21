@@ -26,3 +26,15 @@ def test_nothing_older():
 
 def test_explicit_target_by_commit_prefix():
     assert rollback_target([rec("abc123"), rec("def456")], "def456", "abc").commit == "abc123"
+
+
+def test_interrupted_deploy_rolls_back_to_the_last_completed_one():
+    history = [rec("A"), rec("B")]
+    assert rollback_target(history, "B", None, interrupted=True).commit == "B"
+
+
+def test_records_whose_files_finished_count_even_if_hooks_failed():
+    c = rec("C")
+    c.status, c.files_done = "failed", True
+    assert c.completed
+    assert rollback_target([rec("A"), rec("B"), c], "C", None).commit == "B"

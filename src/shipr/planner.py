@@ -82,8 +82,13 @@ def make_plan(
     rules: Rules,
     remote_hashes: Callable[[list[str]], dict[str, str]] | None = None,
     reserved: str | None = None,
+    recovering: bool = False,
 ) -> Plan:
-    """`reserved` is shipr's state dir relative to the deploy root, if it lives inside it."""
+    """`reserved` is shipr's state dir relative to the deploy root, if it lives inside it.
+
+    `recovering`: the previous deploy was interrupted, so the manifest may miss up to a
+    checkpoint's worth of shipr's own uploads. A stat mismatch is then hash-checked before it
+    is called a server-side edit."""
     # Validate everything before deciding anything, so a bad path aborts before any change.
     for rel in (*local, *manifest_files):
         check_rel(rel)
@@ -92,6 +97,7 @@ def make_plan(
                              "exclude it or move state_path")
     plan = Plan()
     verify: list[str] = []
+    recheck: list[str] = []  # tracked files whose stat changed, while recovering
     opaque = {rel: r.kind for rel, r in remote.items() if r.kind != "file"}
     remote = {rel: r for rel, r in remote.items() if r.kind == "file"}
 
@@ -106,7 +112,11 @@ def make_plan(
             if r is None:
                 plan.uploads.append(Op(rel, "missing on server"))
             elif not stat_matches(m, r):
-                plan.uploads.append(Op(rel, "changed on server since last deploy", backup=True))
+                if recovering:
+                    recheck.append(rel)
+                else:
+                    plan.uploads.append(Op(rel, "changed on server since last deploy",
+                                           backup=True))
             elif lf.sha256 != m.sha256:
                 plan.uploads.append(Op(rel, "changed"))
             else:
@@ -118,13 +128,22 @@ def make_plan(
         else:
             verify.append(rel)  # same size, never deployed by shipr: compare contents
 
-    if verify:
-        hashes = remote_hashes(verify) if remote_hashes else {}
+    if verify or recheck:
+        hashes = remote_hashes(verify + recheck) if remote_hashes else {}
         for rel in verify:
             if hashes.get(rel) == local[rel].sha256:
                 plan.adopt[rel] = local[rel].sha256
             else:
                 plan.uploads.append(Op(rel, "differs from server copy", backup=True))
+        for rel in recheck:
+            h, want, recorded = hashes.get(rel), local[rel].sha256, manifest_files[rel].sha256
+            if h == want:  # shipr's own upload from the interrupted run, or content unchanged
+                plan.adopt[rel] = want
+            elif h == recorded:  # content as recorded, only the stat moved
+                plan.uploads.append(Op(rel, "changed"))
+            else:
+                plan.uploads.append(Op(rel, "changed on server since last deploy",
+                                       backup=True))
         plan.uploads.sort(key=lambda o: o.path)
 
     for rel in sorted(set(manifest_files) - set(local)):

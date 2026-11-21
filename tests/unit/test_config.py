@@ -28,7 +28,7 @@ def test_layering_global_project_defaults_env(tmp_path):
     assert env.provider_settings == {"username": "u", "port": 2222, "timeout": 5, "host": "h"}
     assert env.confirm is True
     assert env.files.exclude == ["b"]
-    assert env.effective_state_path == "/var/www/.shipr"
+    assert env.effective_state_path == "/var/.shipr/www"  # beside the web root
 
 
 def test_interpolation_env_beats_dotenv(tmp_path, monkeypatch):
@@ -163,7 +163,7 @@ def test_unknown_identity_overlap_is_a_warning(tmp_path, monkeypatch):
     }})
     warnings = cfg.state_overlaps("prod")
     assert len(warnings) == 2 and all("can't tell" in w for w in warnings)
-    assert "/var/www/html/.shipr" in warnings[0]
+    assert "/var/www/.shipr/html" in warnings[0]
 
 
 def test_non_overlapping_environments_are_quiet(tmp_path):
@@ -188,3 +188,11 @@ def test_local_provider_compares_real_paths(tmp_path):
         "b": {"remote_path": "/y", "state_path": "/s", "provider": "local",
               "local": {"root": str(other)}}}})
     assert cfg.state_overlaps("a") == []
+
+
+@pytest.mark.parametrize("remote, state", [("/var/www/html", "/var/www/.shipr/html"),
+                                           ("/home/u1/public_html", "/home/u1/.shipr/public_html"),
+                                           ("/srv", "/.shipr/srv")])
+def test_default_state_dir_is_beside_the_web_root(tmp_path, remote, state):
+    env = make(tmp_path, {"environments": {"prod": env_raw(remote)}}).env("prod")
+    assert env.effective_state_path == state and env.state_rel is None

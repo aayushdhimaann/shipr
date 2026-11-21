@@ -17,7 +17,8 @@
 | Overwriting hotfixes made on the server | A file whose size or modified time changed since shipr's last deploy is backed up before it is overwritten. |
 | Half-written files served to visitors | Each upload goes to a temporary file that is then renamed over the target. |
 | Two deploys at once | An exclusive lock file is created on the server for the length of the deploy. A deploy only ever removes its own lock. `kill` (SIGTERM) is handled like Ctrl-C: progress is saved and the lock released. |
-| Deploy records exposed on the website | A `.htaccess` deny is written for Apache, `shipr test` warns, and `state_path` can be moved outside the web root. |
+| Deploy records exposed on the website | By default records live beside the web root, not in it (`/var/www/html` → `/var/www/.shipr/html`). Records inside the web root (configured, or left there by shipr 0.1) trigger a warning on every deploy and in `shipr status` and `shipr test`. `.htaccess` is written but is not relied on: it only works on Apache with `AllowOverride`. |
+| A deploy reported as successful when its records weren't saved | The manifest and the history record are saved separately and checked. If either fails, the deploy exits non-zero, and a manifest that wasn't saved marks the record `failed`. Each record notes whether its files finished, how its hooks went, and whether the manifest was saved. |
 
 ## What you must know
 
