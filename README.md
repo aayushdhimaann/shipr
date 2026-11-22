@@ -306,13 +306,15 @@ records at the default location and in `shipr test`, and `shipr status` labels t
 Whenever the default could be served, set an explicit `state_path` outside the web root, for
 example `/home/deploy/.shipr/my-app-staging`.
 
-**Records inside the web root** (`state_path` under `remote_path`, or records left at
-`<remote_path>/.shipr` by shipr 0.1) still work, but shipr warns on every deploy. Anyone who can
+**Records inside the web root** (`state_path` under `remote_path`, or records in the legacy
+0.1 layout at `<remote_path>/.shipr`) still work, but shipr warns on every deploy. Anyone who can
 reach that path over HTTP can read the manifest, history and backups, and backed-up scripts may
 still run. A `.htaccess` deny is written, but it only works on Apache with `AllowOverride`. On
 nginx, add `location ^~ /.shipr/ { deny all; }`.
 
-**Moving records left inside the web root by shipr 0.1.** With no `state_path` set, shipr keeps
+**Moving legacy 0.1 records out of the web root.** "0.1" here names the old records layout
+(`<remote_path>/.shipr`), which earlier development builds used by default; it is not a package
+release. With no `state_path` set, shipr keeps
 using `<remote_path>/.shipr` until records appear at the new default. shipr never moves, copies or
 deletes them itself, so their history stays intact. To move them:
 
@@ -620,6 +622,10 @@ Details are in [docs/security.md](docs/security.md).
   atomic; pin `host_key` instead.
 
 ## Upgrading from 0.1
+
+shipr 0.2.0 is the first packaged release. "0.1" means the earlier development builds and their
+legacy records layout (`<remote_path>/.shipr`); shipr 0.2.0 still reads that layout and leaves it
+in place until you move it.
 
 Read the "Breaking changes" in [CHANGELOG.md](CHANGELOG.md). The ones most likely to matter:
 
