@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-11-22)
 
 ### Security
 
@@ -223,7 +223,7 @@
 - `RemoteStat` has a new `kind` field and `Provider` a new `roots` attribute. Third-party
   providers keep working unchanged; see docs/providers.md to opt into the symlink checks.
 
-## 0.1.0 (unreleased)
+## 0.1.0 (development builds, never released)
 
 First version.
 
