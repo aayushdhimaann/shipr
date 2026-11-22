@@ -43,14 +43,21 @@ def test_unsafe_archive_members_are_refused(tmp_path, member):
     assert not (tmp_path / "escaped.txt").exists() and not (tmp_path / "outside").exists()
 
 
-def test_absolute_names_stay_inside_the_destination(tmp_path):
+def test_absolute_names_never_land_outside_the_destination(tmp_path):
+    """The filter strips a leading "/" (the file lands inside `dest`); a Windows drive path
+    (C:\\...) is refused outright. Either way nothing is written at the absolute path."""
     if not hasattr(tarfile, "data_filter"):
         pytest.skip("this Python has no extraction filter (covered below)")
     dest = tmp_path / "out"
     dest.mkdir()
-    gitops.extract(make_tar(tmp_path / "a.tar", entry(f"{tmp_path}/abs.txt")), dest)
-    assert not (tmp_path / "abs.txt").exists()  # the filter strips the leading "/"
-    assert (dest / str(tmp_path).lstrip("/") / "abs.txt").exists()
+    target = tmp_path / "abs.txt"
+    try:
+        gitops.extract(make_tar(tmp_path / "a.tar", entry(str(target))), dest)
+    except GitError as e:
+        assert "absolute" in str(e)
+    else:
+        assert list(dest.rglob("abs.txt"))  # stripped of its root, kept inside dest
+    assert not target.exists()
 
 
 def test_safe_archive_is_extracted(tmp_path):

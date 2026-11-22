@@ -26,8 +26,11 @@ def make(tmp_path, raw, global_raw=None):
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     home = tmp_path / "home"
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    for var, value in (("HOME", home), ("USERPROFILE", home),
+                       ("XDG_CONFIG_HOME", home / ".config"), ("APPDATA", home / "AppData")):
+        monkeypatch.setenv(var, str(value))
+    from shipr.paths import app_dir
+    assert app_dir().is_relative_to(home)  # never the real global config (it was, on Windows)
     return home
 
 
