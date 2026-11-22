@@ -3,6 +3,7 @@ file that actually changed, so an interruption at any point leaves accurate reco
 
 from __future__ import annotations
 
+import errno
 import posixpath
 
 from .errors import ConnectionLost, ProviderError, UnsafePath
@@ -17,6 +18,14 @@ CHECKPOINT_EVERY = 25
 # Per-file problems (permission denied, disk full, a symlink that appeared on the server after
 # planning) are recorded and the deploy continues; ConnectionLost stops it.
 FILE_ERRORS = (OSError, ProviderError, UnsafePath)
+
+
+def _maybe_cross_filesystem(e: OSError) -> bool:
+    """What a rename across filesystems raises: EXDEV locally, or OpenSSH's bare "Failure"
+    (an OSError without errno: SFTP v3 has no code for EXDEV). Missing files, permissions
+    (PermissionError), other errno values (EIO, ENOSPC...), symlinks (UnsafePath) and unconfirmed
+    moves (AmbiguousOperation) are not, and stay failures."""
+    return type(e) is OSError and e.errno in (None, errno.EXDEV)
 
 
 class PlanExecutor:
@@ -79,10 +88,7 @@ class PlanExecutor:
         try:
             self.provider.rename(target, backup)  # "delete" = move into the backup folder
         except OSError as e:
-            # A plain OSError is what a cross-filesystem rename gives: EXDEV locally, a bare
-            # "Failure" from OpenSSH. Missing files, permissions, symlinks and unconfirmed
-            # moves (AmbiguousOperation) are other exception types, and stay failures.
-            if type(e) is not OSError:
+            if not _maybe_cross_filesystem(e):
                 raise
             self._copy_then_remove(target, backup, e)
         self.manifest.files.pop(op.path, None)

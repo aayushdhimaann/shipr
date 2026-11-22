@@ -1,5 +1,8 @@
 # shipr — Git-aware SFTP deployment CLI (Plan)
 
+> Original design notes, kept for background. The README, [security.md](security.md) and
+> [FLOW.md](FLOW.md) describe how shipr behaves today; where they differ, they are right.
+
 ## Context
 Projects (PHP, React, Node, Next.js, static) are deployed by hand with FileZilla over SFTP: slow and
 easy to get wrong. **shipr** is an open-source, framework-agnostic Python CLI that deploys an exact Git

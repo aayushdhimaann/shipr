@@ -100,7 +100,11 @@ def test_anchors_and_merge_keys_still_work(tmp_path, home):
     cfg = config.load(write(tmp_path, ANCHORS))
     assert cfg.env("prod").provider_settings == {"host": "h", "username": "u", "port": 2222}
     assert cfg.env("staging").provider_settings["port"] == 22
-    assert cfg.env("qa").provider_settings["username"] == "u"  # first merge source wins
+    # which source of a merge list wins on a shared key is PyYAML's call (6.0.4 changed it):
+    # shipr's loader must agree with plain yaml.safe_load, whichever it is
+    import yaml
+    plain = yaml.safe_load(textwrap.dedent(ANCHORS))["environments"]["qa"]["sftp"]["username"]
+    assert cfg.env("qa").provider_settings["username"] == plain
     assert cfg.env("qa").hooks.remote_after == ["echo qa"]
 
 

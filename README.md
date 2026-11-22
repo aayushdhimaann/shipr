@@ -39,6 +39,8 @@ success: 3 uploaded, 1 deleted, 0 failed in 2.4s (deploy id 20261119T103205123Z-
 - [How it works](#how-it-works)
 - [Safety](#safety)
 - [Troubleshooting](#troubleshooting)
+- [Known limitations](#known-limitations)
+- [Upgrading from 0.1](#upgrading-from-01)
 - [Development](#development)
 - [Contributing, security, license](#contributing-security-license)
 
@@ -70,17 +72,26 @@ success: 3 uploaded, 1 deleted, 0 failed in 2.4s (deploy id 20261119T103205123Z-
 
 ## Installation
 
+shipr is not on PyPI yet. Install it from GitHub, pinned to a release tag, or from a wheel
+built from a release:
+
 ```bash
 # with uv (recommended): installs `shipr` as a global command in its own environment
-uv tool install git+<repo-url>
+uv tool install git+https://github.com/aayushdhimaann/shipr@v0.2.0
 
 # or with pipx
-pipx install git+<repo-url>
+pipx install git+https://github.com/aayushdhimaann/shipr@v0.2.0
+
+# or from a downloaded or locally built wheel
+uv tool install ./shipr-0.2.0-py3-none-any.whl
 
 # or from a local clone
-git clone <repo-url> && cd shipr
+git clone https://github.com/aayushdhimaann/shipr && cd shipr
 uv tool install .
 ```
+
+uv and pipx pick a Python that matches shipr's requirement (3.10.12+, 3.11.4+ or 3.12+). On an
+older patch release shipr refuses to run and says why.
 
 Check that it worked:
 
@@ -468,7 +479,7 @@ the `shipr unlock -e ENV --id <deploy id>` command the error prints.
 **Deploy from CI** (GitHub Actions example):
 
 ```yaml
-- run: uv tool install git+<repo-url>
+- run: uv tool install git+https://github.com/aayushdhimaann/shipr@v0.2.0
 - run: shipr deploy -e production --yes
   env:
     SHIPR_PROD_PASSWORD: ${{ secrets.SHIPR_PROD_PASSWORD }}
@@ -576,10 +587,54 @@ Details are in [docs/security.md](docs/security.md).
 | `you have uncommitted changes` | Only committed content is deployed. Commit first if you want those changes live. |
 | Exit code `4` | Some files failed (shown as `FAILED path: reason`). Fix the cause (often permissions) and deploy again. |
 
+## Known limitations
+
+- **SFTP is path-based.** Every directory is re-checked with `lstat` right before each change,
+  but someone who can write to the deploy folder could still swap in a symlink between that check
+  and the request. The deploy user's permissions are the real boundary (see
+  [docs/security.md](docs/security.md)).
+- **The deploy lock is not an atomic compare-and-delete.** Releasing it is a read followed by a
+  delete. Run `shipr unlock` only when no deploy is running. Locks never expire on their own.
+- **A remote hook that times out may keep running on the server.** shipr stops waiting and fails
+  the deploy; over SFTP it can't kill the remote process. Hooks may also run again on the next
+  deploy, so make them safe to repeat.
+- **Server-side edits are detected by size and modified time**, not content. An edit that keeps
+  both unchanged goes unnoticed.
+- **The default records folder is private only if `remote_path` is the web root.** For a site in
+  a subfolder (e.g. `public_html/staging`), set `state_path` outside the web root.
+- **Backups are never pruned.** Clean up `state_path/backups/` yourself.
+- **Deletions with `state_path` on another filesystem** download and re-upload each file to verify
+  the backup, which is slower. A file edited on the server between that check and its removal is
+  backed up in its earlier version.
+- **Servers that ignore the requested file mode** (some non-OpenSSH servers) leave a temp file at
+  their default mode for one request, before any content is written.
+- **shipr relies on paramiko internals** to create temp files 0600 (paramiko's public `open()`
+  can't send a mode). paramiko is limited to `<6`, and a unit test fails if those internals
+  change.
+- **YAML merge lists with shared keys** (`<<: [*a, *b]` where both set the same key) resolve
+  differently across PyYAML versions (6.0.4 changed it). Avoid overlapping keys in merge lists.
+- **`uv pip install` checks only the lower Python bound**, so it installs shipr on 3.11.0–3.11.3,
+  where shipr then refuses to run. pip, `uv tool` and `uv run` refuse up front.
+- **Windows:** POSIX permission bits don't apply (files follow the folder's access list), and a
+  timed-out local hook is stopped with `taskkill /T`. `known_hosts` appends are not guaranteed
+  atomic; pin `host_key` instead.
+
+## Upgrading from 0.1
+
+Read the "Breaking changes" in [CHANGELOG.md](CHANGELOG.md). The ones most likely to matter:
+
+- Records now go beside `remote_path` by default. Existing records inside the web root keep being
+  used, with a warning, until you move them (see "Where shipr keeps its records").
+- `--trust` needs a terminal; CI must pin `sftp.host_key`.
+- Hooks have a 30-minute default timeout and get no stdin.
+- `shipr validate` rejects invalid SFTP settings and duplicate YAML keys.
+- `shipr unlock --yes` alone no longer removes a lock; use `--id`.
+- Python 3.10.12+, 3.11.4+ or 3.12+, and paramiko 4 or 5, are required.
+
 ## Development
 
 ```bash
-git clone <repo-url> && cd shipr
+git clone https://github.com/aayushdhimaann/shipr && cd shipr
 uv sync                              # create .venv with all dev dependencies
 uv run shipr --help                  # run the CLI from source
 
@@ -587,6 +642,9 @@ uv run ruff check src tests          # lint
 uv run pytest                        # unit, end-to-end and CLI tests (fast, no network)
 uv run pytest -m integration         # real SSH/SFTP servers in Docker (needs Docker)
 ```
+
+Release checks, building and smoke-testing the installed CLI are described in
+[docs/RELEASING.md](docs/RELEASING.md).
 
 The integration suite starts two throwaway containers on random local ports and removes them
 afterwards: `linuxserver/openssh-server` (full SSH) and `atmoz/sftp` (SFTP-only, like shared
@@ -626,5 +684,6 @@ Providers are separate packages that register through an entry point; the core d
 - Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first.
 - Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
 - How every command works, as diagrams: [docs/FLOW.md](docs/FLOW.md).
+- How a release is built and checked: [docs/RELEASING.md](docs/RELEASING.md).
 - The design and roadmap are in [docs/PLAN.md](docs/PLAN.md).
 - shipr is licensed under [MIT](LICENSE).

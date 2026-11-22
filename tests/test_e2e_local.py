@@ -871,17 +871,32 @@ def hooks_yaml(timeout, phase, command):
     return f"hooks:\n  timeout: {timeout}\n  {phase}: [{json.dumps(command)}]\n"  # JSON is YAML
 
 
+def _running(pid: int) -> bool:
+    if sys.platform == "win32":  # os.kill(pid, 0) would *terminate* the process on Windows
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x00100000 | 0x1000, False, pid)  # SYNCHRONIZE|QUERY
+        if not handle:
+            return False  # no such process
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT: running
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True  # (PermissionError: exists, owned by someone else)
+
+
 def process_gone(pid: int, wait: float = 5.0) -> bool:
     import time
 
     end = time.monotonic() + wait
     while time.monotonic() < end:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not _running(pid):
             return True
-        except PermissionError:
-            return False
         time.sleep(0.1)
     return False
 
@@ -898,8 +913,7 @@ def test_hook_timeout_is_reported_quickly(project):
     assert time.monotonic() - t0 < 15
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="checks POSIX process ids")
-@pytest.mark.parametrize("phase", ["remote_after", "local_after"])
+@pytest.mark.parametrize("phase", ["remote_after", "local_after"])  # Windows: taskkill /T
 def test_timed_out_hook_is_stopped_with_its_child_processes(project, tmp_path, phase):
     pid_file = tmp_path / "child.pid"
     project.write_config(hooks_yaml(2, phase, spawn_child(pid_file)))

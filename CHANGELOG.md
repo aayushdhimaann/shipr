@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (unreleased)
 
 ### Security
 
@@ -160,7 +160,27 @@
   (often 0644), so other users on a shared host could read a 0600 file's new content while it
   uploaded. Final modes are unchanged. The local provider does the same (P-5).
 
+### Packaging and release preparation (Phase 3G)
+
+- The version has one source, `src/shipr/__init__.py`, read by the build and by
+  `shipr --version`.
+- Package metadata: Python version classifiers, project URLs, PEP 639 license metadata, and an
+  sdist limited to sources, tests, docs and examples.
+- A deletion falls back to copying only for a cross-filesystem failure (EXDEV, or OpenSSH's bare
+  "Failure"). Other errors, such as EIO or ENOSPC, used to trigger the copy too; they now fail
+  the file as they did before Phase 3F.
+- CI: jobs on the oldest supported patch releases (3.10.12, 3.11.4) replace the old
+  `old-patch-release` probe; the process-tree timeout test now also runs on Windows; a new
+  `package` job builds the wheel and sdist, installs each in a clean environment and runs the
+  installed CLI.
+- `scripts/smoke_installed.py` and docs/RELEASING.md describe and automate the release checks.
+- Not published to PyPI: that waits for trusted publishing.
+
 ### Breaking changes
+
+- **paramiko 4.0 or later, below 6, is required.** paramiko 3.x fails key-plus-passphrase logins
+  next to current `cryptography` releases, and shipr's upload code relies on paramiko internals
+  that are tested on 4.x and 5.x.
 
 - **Python 3.10.12+, 3.11.4+ or 3.12+ is required.** Earlier patch releases already failed on
   every deploy; now they are refused up front. (pip refuses to install on them; uv's `pip

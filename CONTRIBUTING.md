@@ -8,8 +8,11 @@ Setup, running from source, the test suites and the project layout are in the RE
 [Development](README.md#development) section. Before opening a PR, run:
 
 ```bash
-uv run ruff check src tests && uv run pytest && uv run pytest -m integration
+uv run ruff check src tests scripts && uv run pytest && uv run pytest -m integration
 ```
+
+Changes to packaging (`pyproject.toml`, entry points, dependencies) should also pass the release
+checks in [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Guidelines
 

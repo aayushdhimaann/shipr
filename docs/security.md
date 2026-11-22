@@ -29,6 +29,10 @@
 
 ## What you must know
 
+- **Temp files rely on paramiko internals.** paramiko's public `open()` can't send a file mode,
+  so shipr builds the SFTP open request itself (`SFTPClient._request`) to create temp files
+  0600. paramiko is pinned to `<6`; `tests/unit/test_sftp_private_create.py` checks the exact
+  request on every CI run, and the integration suite checks the mode on real servers.
 - **The deploy lock is not a compare-and-swap.** SFTP has no atomic "delete if unchanged", so
   removing a lock is a read followed by a delete. If someone runs `shipr unlock` on a deploy that
   is still running and a second deploy takes the lock within that one round trip, the first

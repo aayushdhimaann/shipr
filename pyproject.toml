@@ -1,27 +1,47 @@
 [project]
 name = "shipr"
-version = "0.1.0"
+dynamic = ["version"]  # from src/shipr/__init__.py (one source for `shipr --version` too)
 description = "Git-aware deployment CLI: ship an exact commit to your servers over SFTP, safely."
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 # 3.10.0-3.10.11 and 3.11.0-3.11.3 lack tarfile extraction filters (safe git export)
 requires-python = ">=3.10.12, !=3.11.0, !=3.11.1, !=3.11.2, !=3.11.3"
 authors = [{ name = "shipr contributors" }]
 keywords = ["deploy", "sftp", "git", "cli", "devops"]
 classifiers = [
+  "Development Status :: 4 - Beta",
   "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Build Tools",
+  "Topic :: System :: Software Distribution",
 ]
 dependencies = [
   "click>=8.1",
-  "paramiko>=3.4",
+  # >=4: paramiko 3.x fails key+passphrase logins next to current `cryptography` releases.
+  # <6: uploads use paramiko internals (SFTPClient._request) to create temp files 0600; run
+  # tests/unit/test_sftp_private_create.py and the integration suite before raising it.
+  "paramiko>=4.0,<6",
   "pathspec>=0.12",
   "pydantic>=2.6",
   "python-dotenv>=1.0",
   "pyyaml>=6.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/aayushdhimaann/shipr"
+Source = "https://github.com/aayushdhimaann/shipr"
+Issues = "https://github.com/aayushdhimaann/shipr/issues"
+Changelog = "https://github.com/aayushdhimaann/shipr/blob/main/CHANGELOG.md"
 
 [project.scripts]
 shipr = "shipr.cli:main"
@@ -34,8 +54,15 @@ local = "shipr.providers.local:LocalProvider"
 dev = ["pytest>=8", "ruff>=0.5"]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]  # 1.27: PEP 639 license metadata
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/shipr/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "tests/", "docs/", "examples/", "scripts/", "CHANGELOG.md",
+           "CONTRIBUTING.md", "SECURITY.md", "uv.lock"]
 
 [tool.ruff]
 line-length = 100
