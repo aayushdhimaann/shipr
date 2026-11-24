@@ -81,7 +81,9 @@ def resolve_target(cfg: Config, env: Environment, ref: str | None) -> tuple[Path
 @contextmanager
 def prepare(cfg: Config, env: Environment, ref: str | None, ui: UI) -> Iterator[Workspace]:
     """Yield a built Workspace living in a temp dir that is removed afterwards."""
-    with tempfile.TemporaryDirectory(prefix="shipr-") as tmp:
+    # Windows: a process a timed-out hook started can hold the dir for a moment after
+    # taskkill; a failed cleanup must not replace the deploy's real error
+    with tempfile.TemporaryDirectory(prefix="shipr-", ignore_cleanup_errors=True) as tmp:
         yield _build(cfg, env, ref, ui, Path(tmp))
 
 
