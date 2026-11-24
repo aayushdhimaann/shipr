@@ -72,18 +72,23 @@ success: 3 uploaded, 1 deleted, 0 failed in 2.4s (deploy id 20261119T103205123Z-
 
 ## Installation
 
-shipr is not on PyPI yet. Install it from GitHub, pinned to a release tag, or from a wheel
-built from a release:
+shipr is on [PyPI](https://pypi.org/project/shipr/):
 
 ```bash
 # with uv (recommended): installs `shipr` as a global command in its own environment
-uv tool install git+https://github.com/aayushdhimaann/shipr@v0.2.0
+uv tool install shipr
 
 # or with pipx
-pipx install git+https://github.com/aayushdhimaann/shipr@v0.2.0
+pipx install shipr
 
-# or from a downloaded or locally built wheel
-uv tool install ./shipr-0.2.0-py3-none-any.whl
+# or run it once without installing
+uvx shipr --help
+
+# upgrade later
+uv tool upgrade shipr
+
+# or straight from GitHub, pinned to a release tag
+uv tool install git+https://github.com/aayushdhimaann/shipr@v0.2.0
 
 # or from a local clone
 git clone https://github.com/aayushdhimaann/shipr && cd shipr
@@ -515,7 +520,7 @@ the `shipr unlock -e ENV --id <deploy id>` command the error prints.
 **Deploy from CI** (GitHub Actions example):
 
 ```yaml
-- run: uv tool install git+https://github.com/aayushdhimaann/shipr@v0.2.0
+- run: uv tool install shipr==0.2.0  # pin the version in CI
 - run: shipr deploy -e production --yes
   env:
     SHIPR_PROD_PASSWORD: ${{ secrets.SHIPR_PROD_PASSWORD }}
