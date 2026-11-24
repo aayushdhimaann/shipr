@@ -82,7 +82,11 @@ def _age(since: str | None, now: str) -> str | None:
     if secs < 0:
         return None
     d, h, m = secs // 86400, secs // 3600 % 24, secs // 60 % 60
-    return (f"{d}d {h}h" if d else f"{h}h {m}m" if h else f"{m}m" if m else f"{secs}s")
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m" if m else f"{secs}s"
 
 
 class RemoteState:

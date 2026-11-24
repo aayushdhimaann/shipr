@@ -16,7 +16,7 @@ from .engine import (
 from .errors import Aborted, DeployError, LockedError, ProviderError
 from .hooks import remote_exec_available
 from .models import DeployRecord, Manifest
-from .planner import blocked_reason, stat_matches
+from .planner import UNVERIFIED, blocked_reason, stat_matches
 from .state import LockInfo
 from .ui import UI
 
@@ -36,10 +36,14 @@ def status(env: Environment, project: str) -> Status:
         state = state_for(env, provider)
         manifest = state.load_manifest()
         warnings = state.check_owner(manifest, project) + state_warnings(env, state)
-        remote = scan_remote(env, provider, state)
+        remote = scan_remote(env, provider, state, managed=manifest.files)
         opaque = {rel: r.kind for rel, r in remote.items() if r.kind != "file"}
         drift = []
+        unverified = 0
         for rel, entry in sorted(manifest.files.items()):
+            if entry.mtime == UNVERIFIED:  # recorded without looking (server_check: changed)
+                unverified += 1
+                continue
             r = remote.get(rel)
             why = blocked_reason(rel, opaque)
             if why:
@@ -48,6 +52,10 @@ def status(env: Environment, project: str) -> Status:
                 drift.append((rel, "missing on server"))
             elif not stat_matches(entry, r):
                 drift.append((rel, "changed on server"))
+        if unverified:
+            warnings.append(f"{unverified} files were recorded without looking at the server "
+                            "(server_check: changed): status can't tell whether they changed "
+                            "there")
         return Status(manifest, drift, state.read_lock(), provider.describe(), state.root,
                       warnings)
 
@@ -105,9 +113,10 @@ def check_connection(env: Environment, trust: bool, ui: UI) -> bool:
             ui.echo(f"cannot write to {state.root}: {e}")
             return False
 
-        remote = scan_remote(env, provider, state)
+        remote = scan_remote(env, provider, state, managed=())  # its top level only
         opaque = sorted(rel for rel, r in remote.items() if r.kind != "file")
-        ui.echo(f"remote_path {env.remote_path}: {len(remote) - len(opaque)} files found")
+        ui.echo(f"remote_path {env.remote_path}: readable, {len(remote) - len(opaque)} files "
+                "at its top level")
         if opaque:
             ui.echo(f"{len(opaque)} symlinks, special files or unreadable directories are "
                     "never touched: " + ", ".join(opaque[:5]) + (" ..." if len(opaque) > 5 else ""))

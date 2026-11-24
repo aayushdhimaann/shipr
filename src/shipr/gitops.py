@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import platform
 import subprocess
 import tarfile
@@ -45,6 +46,22 @@ def branch_at(ref: str, sha: str, cwd: Path) -> str | None:
                check=False) == sha:
             return ref
     return None
+
+
+def blobs(rev: str, cwd: Path) -> dict[str, str]:
+    """Repo-relative path -> git blob id of every file in `rev`."""
+    out = {}
+    for entry in git("ls-tree", "-r", "-z", "--full-tree", rev, cwd=cwd).split("\0"):
+        meta, _, path = entry.partition("\t")
+        if meta.split(" ")[1:2] == ["blob"]:
+            out[path] = meta.split(" ")[2]
+    return out
+
+
+def blob_id(path: Path) -> str:
+    """The id git gives this file's content."""
+    data = path.read_bytes()
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
 def dirty_files(cwd: Path) -> list[str]:

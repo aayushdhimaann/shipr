@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -1334,3 +1335,347 @@ def test_crash_between_copy_and_removal_loses_nothing(project, monkeypatch):
     rec = run(project, yes=True)  # the next deploy finishes the job
     assert rec.status == "success" and [d.path for d in rec.deleted] == ["old/gone.txt"]
     assert not (project.site / "old" / "gone.txt").exists()
+
+
+# --- only folders that hold shipr's files are listed (real-server test) --------------------------
+def watch_listed_dirs(monkeypatch, project):
+    """Server folders the local provider lists (os.walk yields each folder it lists)."""
+    import shipr.providers.local as local_mod
+
+    real, seen = local_mod.os.walk, []
+
+    def walk(top, *a, **k):
+        for entry in real(top, *a, **k):
+            if Path(entry[0]).is_relative_to(project.server):  # (os.walk is shared: not the build)
+                seen.append(Path(entry[0]).relative_to(project.server).as_posix())
+            yield entry
+    monkeypatch.setattr(local_mod.os, "walk", walk)
+    return seen
+
+
+def server_only_tree(project):
+    """What a real PHP server holds besides the deployed site: vendor/, sessions, git data."""
+    for rel in ("vendor/a/b/c.php", "vendor/d/e.php", "writable/session/s1", ".git/objects/ab/cd",
+                "uploads/2026/user-file.pdf"):
+        p = project.site / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("server only")
+
+
+def test_deploy_lists_only_folders_that_hold_shipr_files(project, monkeypatch):
+    project.write("index.php", "1")
+    project.write("app/Controllers/Home.php", "2")
+    project.write("old/gone.txt", "3")
+    project.commit()
+    project.site.mkdir(parents=True)
+    server_only_tree(project)
+    run(project)
+    (project.repo / "old" / "gone.txt").unlink()
+    project.commit()
+    seen = watch_listed_dirs(monkeypatch, project)
+    rec = run(project, yes=True)
+    assert [d.path for d in rec.deleted] == ["old/gone.txt"]  # a manifest-only folder: listed
+    assert set(seen) == {"site", "site/app", "site/app/Controllers", "site/old"}, seen
+    assert (project.site / "vendor/a/b/c.php").read_text() == "server only"  # untouched
+
+
+def test_status_and_test_do_not_crawl_the_whole_server(project, monkeypatch):
+    project.write("index.php", "1")
+    project.commit()
+    run(project)
+    server_only_tree(project)
+    seen = watch_listed_dirs(monkeypatch, project)
+    env = load_env(project.repo)[1]
+    assert admin.status(env, "demo").drift == []
+    assert set(seen) == {"site"}, seen
+    seen.clear()
+    ui = RecordingUI()
+    assert admin.check_connection(env, False, ui)
+    assert set(seen) == {"site"}, seen
+
+
+def test_providers_without_the_descend_argument_still_work():
+    from shipr.engine import scan_remote
+
+    class OldWalk:
+        def walk(self, root, skip=None):  # a third-party provider written before `descend`
+            return {"index.php": "stat"}
+
+    class Env:
+        remote_path = "/site"
+
+    class State:
+        inside_webroot, root = False, "/.shipr/site"
+    assert scan_remote(Env(), OldWalk(), State(), managed={"index.php"}) == {"index.php": "stat"}
+
+
+# --- server_check: changed (+ server_commit) ------------------------------------------------------
+def pipeline_deployed(project, files):
+    """The server already holds these files, uploaded by another tool (no shipr records)."""
+    for rel, text in files.items():
+        p = project.site / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+
+def count_server_reads(monkeypatch):
+    from shipr.providers.local import LocalProvider
+
+    reads = []
+    real = LocalProvider.download
+
+    def download(self, remote, local):
+        if remote.startswith("/site/"):  # a site file (not shipr's records)
+            reads.append(remote)
+        return real(self, remote, local)
+    monkeypatch.setattr(LocalProvider, "download", download)
+    return reads
+
+
+def changed_mode(project, server_commit=None, backups=True):
+    add_env_option(project, "server_check: changed")
+    if server_commit:
+        add_env_option(project, f"server_commit: {server_commit}")
+    if not backups:
+        add_env_option(project, "backup_replaced: false")
+
+
+def two_folder_site(project):
+    """app/ and lib/ each with files, as the old pipeline deployed them at commit `base`."""
+    files = {"app/a.php": "<?php 1;", "app/b.php": "<?php 1;", "lib/c.php": "<?php 1;",
+             "lib/d.php": "<?php 1;"}
+    for rel, text in files.items():
+        project.write(rel, text)
+    base = project.commit("what the pipeline deployed")
+    pipeline_deployed(project, {**files, "lib/d.php": "<?php 1; // server hotfix",
+                                "writable/session.txt": "x"})
+    return base
+
+
+def test_changed_mode_first_deploy_only_touches_files_changed_since_server_commit(
+        project, monkeypatch):
+    base = two_folder_site(project)
+    project.write("app/a.php", "<?php 2;")  # changed in git, same size
+    project.write("app/new.php", "<?php 3;")
+    project.commit()
+    changed_mode(project, base[:9], backups=False)
+    seen = watch_listed_dirs(monkeypatch, project)
+    reads = count_server_reads(monkeypatch)
+    ui = RecordingUI()
+    rec = run(project, ui=ui)
+    assert set(seen) == {"site", "site/app"}, seen  # lib/ is never listed
+    assert sorted(u.path for u in rec.uploaded) == ["app/a.php", "app/new.php"]
+    assert reads == []  # replaced as is: not compared, not backed up
+    assert all(u.backup is None for u in rec.uploaded)
+    assert not (project.state / "backups").exists()
+    assert "3 files unchanged since" in ui.text
+    assert (project.site / "lib/d.php").read_text() == "<?php 1; // server hotfix"  # trusted
+    files = manifest(project)["files"]
+    assert set(files) == {"app/a.php", "app/b.php", "app/new.php", "lib/c.php", "lib/d.php"}
+    assert files["lib/c.php"]["mtime"] == 0 and files["app/new.php"]["mtime"] > 0
+
+
+def test_changed_mode_later_deploys_look_only_at_what_changed(project, monkeypatch):
+    base = two_folder_site(project)
+    changed_mode(project, base)
+    run(project)
+    project.write("lib/c.php", "<?php 22;")
+    (project.repo / "app" / "b.php").unlink()
+    project.commit()
+    seen = watch_listed_dirs(monkeypatch, project)
+    rec = run(project, yes=True)
+    assert set(seen) == {"site", "site/app", "site/lib"}, seen  # only folders with changes
+    assert [u.path for u in rec.uploaded] == ["lib/c.php"]
+    assert [d.path for d in rec.deleted] == ["app/b.php"]  # deletions still asked and backed up
+    seen.clear()
+    assert run(project).status == "up-to-date" and set(seen) <= {"site"}
+
+
+def test_changed_mode_retries_a_file_that_failed_to_upload(project, monkeypatch):
+    from shipr.providers.local import LocalProvider
+
+    base = two_folder_site(project)
+    changed_mode(project, base)
+    run(project)
+    project.write("app/a.php", "<?php 7;")
+    project.commit()
+    real = LocalProvider.upload
+
+    def upload(self, local, remote, mode=None):
+        if remote.endswith("app/a.php"):
+            raise PermissionError(13, "denied")
+        return real(self, local, remote, mode)
+    monkeypatch.setattr(LocalProvider, "upload", upload)
+    assert run(project).status == "partial"
+    monkeypatch.setattr(LocalProvider, "upload", real)
+    rec = run(project)  # same commit, unchanged in git: retried because it never got there
+    assert [u.path for u in rec.uploaded] == ["app/a.php"]
+    assert (project.site / "app/a.php").read_text() == "<?php 7;"
+
+
+def test_changed_mode_without_server_commit_checks_everything_once(project, monkeypatch):
+    two_folder_site(project)
+    changed_mode(project)
+    seen = watch_listed_dirs(monkeypatch, project)
+    ui = RecordingUI()
+    rec = run(project, ui=ui)
+    assert {"site/app", "site/lib"} <= set(seen) and "checks every file" in ui.text
+    assert [u.path for u in rec.uploaded] == ["lib/d.php"]  # the server hotfix was noticed
+    assert rec.uploaded[0].backup  # backed up first: backup_replaced is on by default
+
+
+def test_changed_mode_after_an_interrupted_deploy_checks_everything(project, monkeypatch):
+    base = two_folder_site(project)
+    changed_mode(project, base)
+    run(project)
+    m = manifest(project)
+    m["in_progress"] = {"deploy_id": "x", "by": "y", "started": "z"}
+    (project.state / "manifest.json").write_text(json.dumps(m))
+    seen = watch_listed_dirs(monkeypatch, project)
+    ui = RecordingUI()
+    run(project, ui=ui)
+    assert {"site/app", "site/lib"} <= set(seen) and "interrupted" in ui.text
+
+
+def test_a_file_the_build_changed_is_never_trusted(project):
+    project.write("version.txt", "v0")
+    base = project.commit()
+    pipeline_deployed(project, {"version.txt": "v0"})
+    project.write_config(f'build:\n  commands: [\'"{PY}" -c "open(\\"version.txt\\", \\"w\\")'
+                         f'.write(\\"v9\\")"\']\n')
+    project.commit()
+    changed_mode(project, base)
+    rec = run(project)  # unchanged in git, but the build rewrote it: checked, not trusted
+    assert [u.path for u in rec.uploaded] == ["version.txt"]
+    assert (project.site / "version.txt").read_text() == "v9"
+
+
+def test_unknown_server_commit_stops_before_any_change(project):
+    project.write("a.php", "1")
+    project.commit()
+    changed_mode(project, "deadbeef1234")
+    with pytest.raises(DeployError, match="server_commit"):
+        run(project)
+    assert not project.site.exists()
+
+
+def test_switching_back_to_full_checks_trusted_files_without_calling_them_edits(project):
+    base = two_folder_site(project)
+    changed_mode(project, base)
+    run(project)
+    project.write_config()  # server_check: full again
+    rec = run(project)
+    # lib/d.php differs on the server (its hotfix): replaced with a backup, as for any file
+    # shipr never checked; the identical ones are just recorded, not re-uploaded
+    assert {u.path: u.reason for u in rec.uploaded} == {"lib/d.php": "differs from server copy"}
+    assert all(e["mtime"] > 0 for e in manifest(project)["files"].values())
+    env = load_env(project.repo)[1]
+    assert admin.status(env, "demo").drift == []
+
+
+def test_changed_mode_backs_up_a_replaced_file_by_default(project):
+    base = two_folder_site(project)
+    changed_mode(project, base)
+    run(project)
+    project.write("lib/d.php", "<?php 4;")  # the file that was hot-fixed on the server
+    project.commit()
+    rec = run(project)
+    [up] = rec.uploaded
+    assert up.path == "lib/d.php" and up.backup
+    assert (project.server / up.backup.lstrip("/")).read_text() == "<?php 1; // server hotfix"
+    assert (project.site / "lib/d.php").read_text() == "<?php 4;"
+
+
+def test_changed_mode_without_backups_just_replaces(project):
+    base = two_folder_site(project)
+    changed_mode(project, base, backups=False)
+    run(project)
+    project.write("lib/d.php", "<?php 4;")
+    project.commit()
+    rec = run(project)
+    assert [(u.path, u.backup) for u in rec.uploaded] == [("lib/d.php", None)]
+    assert (project.site / "lib/d.php").read_text() == "<?php 4;"
+    assert not (project.state / "backups").exists()
+
+
+def test_backup_replaced_false_skips_drift_backups_but_not_deletions(project):
+    project.write("a.txt", "v1")
+    project.write("b.txt", "bye")
+    project.commit()
+    add_env_option(project, "backup_replaced: false")
+    run(project)
+    (project.site / "a.txt").write_text("hotfix on the server")
+    (project.repo / "b.txt").unlink()
+    project.commit()
+    rec = run(project, yes=True)
+    assert [(u.path, u.reason, u.backup) for u in rec.uploaded] == \
+        [("a.txt", "changed on server since last deploy", None)]
+    assert (project.site / "a.txt").read_text() == "v1"
+    assert (project.server / rec.deleted[0].backup.lstrip("/")).read_text() == "bye"
+
+
+def test_changed_mode_still_backs_up_deletions(project):
+    base = two_folder_site(project)
+    changed_mode(project, base)
+    run(project)
+    (project.repo / "lib" / "c.php").unlink()
+    project.commit()
+    rec = run(project, yes=True)
+    assert (project.server / rec.deleted[0].backup.lstrip("/")).read_text() == "<?php 1;"
+
+
+def test_status_does_not_report_unchecked_files_as_drift(project):
+    base = two_folder_site(project)
+    changed_mode(project, base)
+    run(project)
+    s = admin.status(load_env(project.repo)[1], "demo")
+    assert s.drift == [] and any("without looking" in w for w in s.warnings)
+
+
+def test_reading_the_server_reports_progress(project):
+    for i in range(60):
+        project.write(f"d{i:02}/f.php", "x")
+    project.commit()
+    run(project)  # the folders now exist on the server
+    ui = RecordingUI()
+    run(project, ui=ui, dry_run=True)
+    assert "reading the server's file list (61 folders)" in ui.text
+    assert "listed 25/61 folders" in ui.text and "listed 50/61 folders" in ui.text
+    assert re.search(r"read 61 folders in \d+s", ui.text), ui.text
+
+
+def test_comparing_server_copies_reports_progress(project):
+    files = {f"f{i:03}.php": "x" for i in range(120)}
+    for rel, text in files.items():
+        project.write(rel, text)
+    project.commit()
+    pipeline_deployed(project, files)  # same size on the server: each must be compared
+    ui = RecordingUI()
+    run(project, ui=ui, dry_run=True)
+    assert "comparing 120 files with their server copies" in ui.text, ui.text
+    assert "compared 50/120 files" in ui.text and "compared 100/120 files" in ui.text
+
+
+def test_changed_mode_deploys_every_commit_since_the_last_deploy(project):
+    base = two_folder_site(project)
+    changed_mode(project, base)
+    run(project)
+    project.write("app/a.php", "<?php 10;")  # commit 1
+    project.commit("one")
+    project.write("lib/c.php", "<?php 20;")  # commit 2
+    project.write("app/b.php", "<?php 99;")
+    project.commit("two")
+    (project.repo / "lib" / "d.php").unlink()  # commit 3
+    project.write("app/b.php", "<?php 1;")  # back to what the server already has
+    project.write("new/e.php", "<?php 30;")
+    project.commit("three")
+    ui = RecordingUI()
+    rec = run(project, ui=ui, yes=True)  # one deploy covers all three commits
+    assert re.search(r"3 commits since [0-9a-f]{9}:\n  \S+ three\n  \S+ two\n  \S+ one", ui.text), \
+        ui.text
+    assert sorted(u.path for u in rec.uploaded) == ["app/a.php", "lib/c.php", "new/e.php"]
+    assert [d.path for d in rec.deleted] == ["lib/d.php"]
+    for rel, text in {"app/a.php": "<?php 10;", "lib/c.php": "<?php 20;", "new/e.php": "<?php 30;",
+                      "app/b.php": "<?php 1;"}.items():
+        assert (project.site / rel).read_text() == text
+    assert manifest(project)["deployed_commit"] == rec.commit

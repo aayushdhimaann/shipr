@@ -1,6 +1,7 @@
 # Contributing
 
-Thanks for helping. Bug reports, docs fixes, providers and features are all welcome.
+Thanks for helping. Bug reports, docs fixes, providers and features are all welcome. Everyone
+taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## Setup and checks
 
@@ -22,7 +23,10 @@ checks in [docs/RELEASING.md](docs/RELEASING.md).
   through the planner, path checks and backups. Never log credentials.
 - **Tests come with changes.** For a bug fix, add a test that fails without it.
 - Keep dependencies minimal; discuss new ones in an issue first.
-- Use small, focused commits with messages in the imperative mood ("Add FTP provider").
+- Use small, focused commits with messages in the imperative mood ("Add FTP provider"). One
+  change per pull request; for a new option or a behaviour change, open an issue first.
+- If AI tools wrote part of a change, say so in the pull request. You're responsible for every
+  line either way, especially anything that writes, moves or deletes server files.
 
 ## Architecture rules
 

@@ -145,3 +145,19 @@ def test_recovery_hash_checks_stat_mismatches_before_calling_them_hotfixes():
 def test_without_recovery_stat_mismatch_is_still_a_hotfix():
     p = plan({"x": lf("new")}, {"x": m("old")}, {"x": rs(mtime=999)}, hashes={"x": "new"})
     assert reasons(p) == {"x": ("changed on server since last deploy", True)}
+
+
+# --- server_check: changed records files without looking (mtime 0) -----------------------------
+def test_unverified_entries_are_compared_not_called_server_edits():
+    unverified = {"same.php": m("a", 3, mtime=0), "other.php": m("b", 3, mtime=0)}
+    remote = {"same.php": rs(3, mtime=555), "other.php": rs(3, mtime=555)}
+    p = make_plan({"same.php": lf("a", 3), "other.php": lf("b", 3)}, unverified, remote,
+                  Rules(Files()), lambda rels: {"same.php": "a", "other.php": "hotfix"})
+    assert p.adopt == {"same.php": "a"}
+    assert reasons(p) == {"other.php": ("differs from server copy", True)}
+
+
+def test_without_trust_same_size_files_are_still_compared():
+    p = make_plan({"x.php": lf("a", 3)}, {}, {"x.php": rs(3)}, Rules(Files()),
+                  lambda rels: {"x.php": "other"})
+    assert reasons(p) == {"x.php": ("differs from server copy", True)}

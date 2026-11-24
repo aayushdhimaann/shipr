@@ -1,7 +1,8 @@
 """SFTP provider (paramiko).
 
 Settings: host, port=22, username, password | key_file [+ passphrase] (neither: ssh-agent),
-timeout=15, retries=3, known_hosts (extra file, optional), host_key (pinned fingerprint(s)).
+timeout=15, retries=3, known_hosts (extra file, optional), host_key (pinned fingerprint(s)),
+parallel=4 (channels for reading files to hash them when the server has no shell).
 Host keys are always verified. A pinned `host_key` is the trust anchor and wins over
 known_hosts. Otherwise an unknown host is only accepted with `trust_new_host` *and* an explicit
 confirmation of its fingerprint (a terminal prompt), then saved to shipr's own known_hosts.
@@ -10,14 +11,17 @@ confirmation of its fingerprint (a terminal prompt), then saved to shipr's own k
 from __future__ import annotations
 
 import codecs
+import hashlib
 import os
 import posixpath
 import re
 import shlex
 import socket
 import stat as statmod
+import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -57,6 +61,8 @@ class SFTPSettings(BaseModel):
     passphrase: SecretStr | None = None
     timeout: float = Field(15, gt=0)
     retries: int = Field(3, ge=0)
+    # SFTP channels used at once to read files when the server can't hash them itself
+    parallel: int = Field(4, ge=1, le=16)
     known_hosts: str | None = None
     # pinned server key fingerprint(s), as `ssh-keygen -lf` prints them; a list while rotating
     host_key: list[str] | None = None
@@ -131,6 +137,8 @@ def _remember(store: Path, line: str) -> None:
         line = "\n" + line
     fd = os.open(store, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
+        if hasattr(os, "fchmod"):  # a file others can write could add keys shipr then trusts
+            os.fchmod(fd, 0o600)
         os.write(fd, line.encode("utf-8"))
     finally:
         os.close(fd)
@@ -159,6 +167,26 @@ def _attrs(sftp: paramiko.SFTPClient, path: str) -> paramiko.SFTPAttributes | No
         return None
 
 
+class _Expired(Exception):
+    """The deadline passed before the channel's output ended."""
+
+
+def _recv_all(chan: paramiko.Channel, deadline: float | None) -> Iterator[bytes]:
+    """The channel's data until its end, or _Expired once `deadline` (None: no limit) passes."""
+    while True:
+        left = None if deadline is None else deadline - time.monotonic()
+        if left is not None and left <= 0:
+            raise _Expired
+        chan.settimeout(1.0 if left is None else min(1.0, left))
+        try:
+            data = chan.recv(65536)
+        except TimeoutError:
+            continue
+        if not data:
+            return
+        yield data
+
+
 def _read_lines(chan: paramiko.Channel, deadline: float | None,
                 on_output: Callable[[str], None] | None) -> str | None:
     """Read a channel to its end until `deadline` (None: no limit). With `on_output`, each
@@ -167,32 +195,52 @@ def _read_lines(chan: paramiko.Channel, deadline: float | None,
     decode = codecs.getincrementaldecoder("utf-8")("replace").decode
     kept: list[str] = []
     pending = ""
-
-    def emit(line: str) -> None:
-        if on_output:
-            on_output(line.rstrip("\r"))
-    while True:
-        left = None if deadline is None else deadline - time.monotonic()
-        if left is not None and left <= 0:
-            return None
-        chan.settimeout(1.0 if left is None else min(1.0, left))
-        try:
-            data = chan.recv(65536)
-        except TimeoutError:
-            continue
-        if not data:
-            break
-        text = decode(data)
-        if not on_output:
-            kept.append(text)
-            continue
-        *lines, pending = (pending + text).split("\n")
-        for line in lines:
-            emit(line)
+    try:
+        for data in _recv_all(chan, deadline):
+            text = decode(data)
+            if not on_output:
+                kept.append(text)
+                continue
+            *lines, pending = (pending + text).split("\n")
+            for line in lines:
+                on_output(line.rstrip("\r"))
+    except _Expired:
+        return None
     rest = pending + decode(b"", True)
-    if on_output and rest:
-        emit(rest)
-    return "".join(kept) + ("" if on_output else rest)
+    if not on_output:
+        return "".join(kept) + rest
+    if rest:
+        on_output(rest.rstrip("\r"))
+    return ""
+
+
+def _rename_state(src: str, dst: str, here: str | bool | None,
+                  there: str | bool | None) -> str:
+    """Why a move whose reply was lost can't be judged, from what exists at each end."""
+    if here and there:
+        return f"both {src} and {dst} exist"
+    if not here and not there:
+        return f"neither {src} nor {dst} exists"
+    return f"{src if here else dst} is not a regular file"
+
+
+def _sort_listing(entries: list[paramiko.SFTPAttributes], d: str, rel: str,
+                  out: dict[str, RemoteStat], skip: str | None,
+                  descend: Callable[[str], bool] | None) -> list[tuple[str, str]]:
+    """Put the files (and symlinks, special files) of one listing into `out`; return the
+    folders to list next. READDIR attrs are lstat attrs: a symlink is reported as one."""
+    folders = []
+    for a in entries:
+        path = posixpath.join(d, a.filename)
+        kind = _kind(a)
+        if kind == "dir":
+            if path != skip and (descend is None or descend(rel + a.filename)):
+                folders.append((path, f"{rel}{a.filename}/"))
+        elif kind == "file":
+            out[rel + a.filename] = _remote_stat(a)
+        else:
+            out[rel + a.filename] = RemoteStat(a.st_size or 0, int(a.st_mtime or 0), kind=kind)
+    return folders
 
 
 _SHA256_LINE = re.compile(r"([0-9a-f]{64}) [ *](.*)")
@@ -380,15 +428,9 @@ class SFTPProvider(Provider):
                 return []
         return self._retry(op)
 
-    def walk(self, root: str, skip: str | None = None) -> dict[str, RemoteStat]:
-        def root_ok(sftp: paramiko.SFTPClient) -> bool:
-            if not self._check_dirs(root):
-                return False
-            if self.roots and root not in self.roots and self._lkind(root) not in (None, "dir"):
-                raise UnsafePath(f"refusing to list {root}: it is not a directory")
-            return True
-
-        if not self._retry(root_ok):
+    def walk(self, root: str, skip: str | None = None,
+             descend: Callable[[str], bool] | None = None) -> dict[str, RemoteStat]:
+        if not self._retry(lambda _sftp: self._walk_root_ok(root)):
             return {}
         out: dict[str, RemoteStat] = {}
         pending = [(root, "")]
@@ -402,18 +444,15 @@ class SFTPProvider(Provider):
                 # permission denied (or a server-side failure): report it, never guess
                 out[rel[:-1]] = RemoteStat(0, 0, kind="unreadable")
                 continue
-            for a in entries:
-                path = posixpath.join(d, a.filename)
-                kind = _kind(a)  # READDIR attrs are lstat attrs: a symlink is reported as one
-                if kind == "dir":
-                    if path != skip:
-                        pending.append((path, f"{rel}{a.filename}/"))
-                elif kind == "file":
-                    out[rel + a.filename] = _remote_stat(a)
-                else:
-                    out[rel + a.filename] = RemoteStat(a.st_size or 0, int(a.st_mtime or 0),
-                                                       kind=kind)
+            pending += _sort_listing(entries, d, rel, out, skip, descend)
         return out
+
+    def _walk_root_ok(self, root: str) -> bool:
+        if not self._check_dirs(root):
+            return False
+        if self.roots and root not in self.roots and self._lkind(root) not in (None, "dir"):
+            raise UnsafePath(f"refusing to list {root}: it is not a directory")
+        return True
 
     @staticmethod
     def _replace(sftp: paramiko.SFTPClient, src: str, dst: str) -> None:
@@ -446,18 +485,12 @@ class SFTPProvider(Provider):
 
     def upload(self, local: Path, remote: str, mode: int | None = None) -> RemoteStat:
         """The temp file is created 0600 and only gets its final mode (`mode`, else the
-        server's default for a new file) once it is complete (P-5)."""
+        server's default for a new file) once it is complete."""
         def op(sftp: paramiko.SFTPClient) -> RemoteStat:
             self._ensure_dirs(remote)
             self._check_target(remote)
             tmp = tmp_name(remote)
-            tmp_kind = self._lkind(tmp)
-            if tmp_kind == "dir":
-                raise UnsafePath(f"refusing {remote}: {tmp} is a directory")
-            if tmp_kind is not None:
-                # a link is removed itself, never its target; a file is a partial copy of a
-                # repo file from an earlier attempt: recreated, so it is private from the start
-                sftp.remove(tmp)
+            self._clear_tmp(sftp, remote, tmp)
             if mode is None and posixpath.dirname(tmp) not in self._default_modes:
                 self._learn_default_mode(sftp, tmp)
                 self._ensure_dirs(remote)  # fresh checks again, right before the real write
@@ -477,6 +510,16 @@ class SFTPProvider(Provider):
             self._replace(sftp, tmp, remote)
             return _remote_stat(sftp.lstat(remote))
         return self._retry(op)
+
+    def _clear_tmp(self, sftp: paramiko.SFTPClient, remote: str, tmp: str) -> None:
+        """A link at the temp path is removed itself, never its target; a file is a partial
+        copy of a repo file from an earlier attempt: recreated, so it is private from the
+        start. A directory there is refused."""
+        tmp_kind = self._lkind(tmp)
+        if tmp_kind == "dir":
+            raise UnsafePath(f"refusing {remote}: {tmp} is a directory")
+        if tmp_kind is not None:
+            sftp.remove(tmp)
 
     @staticmethod
     def _create_private(sftp: paramiko.SFTPClient, path: str,
@@ -578,24 +621,24 @@ class SFTPProvider(Provider):
         if here == "file" and not there:
             return False
         if not here and there == "file":
-            size, digest = before
-            if digest is None:
-                why = "the server can't run sha256sum, so the moved content can't be checked"
-            elif self._sftp.lstat(dst).st_size != size or \
-                    self._sha256sum([dst]).get(dst) != digest:
-                why = f"{dst} doesn't hold the content {src} had"
-            else:
+            why = self._moved_mismatch(src, dst, before)
+            if why is None:
                 return True
-        elif here and there:
-            why = f"both {src} and {dst} exist"
-        elif not here and not there:
-            why = f"neither {src} nor {dst} exists"
         else:
-            why = f"{src if here else dst} is not a regular file"
+            why = _rename_state(src, dst, here, there)
         raise AmbiguousOperation(
             f"could not confirm whether moving {src} to {dst} completed: the connection dropped "
             f"before the server replied, and {why}. Nothing was repeated or undone; check both "
             "paths, then deploy again.")
+
+    def _moved_mismatch(self, src: str, dst: str, before: tuple[int, str | None]) -> str | None:
+        """None if `dst` provably holds what `src` held before the move; otherwise why not."""
+        size, digest = before
+        if digest is None:
+            return "the server can't run sha256sum, so the moved content can't be checked"
+        if self._sftp.lstat(dst).st_size != size or self._sha256sum([dst]).get(dst) != digest:
+            return f"{dst} doesn't hold the content {src} had"
+        return None
 
     def rmdir_if_empty(self, path: str) -> bool:
         def op(sftp: paramiko.SFTPClient) -> bool:
@@ -694,12 +737,84 @@ class SFTPProvider(Provider):
                                 f"{e or type(e).__name__} ({command})") from None
 
     def sha256(self, paths: list[str]) -> dict[str, str]:
-        """Hash with `sha256sum` over SSH where possible, else by downloading."""
+        """Hash with `sha256sum` over SSH where possible, else by reading the files."""
         out = self._sha256sum(paths)
         missing = [p for p in paths if p not in out]
         if missing:
-            out.update(super().sha256(missing))
+            out.update(self._read_hashes(missing))
         return out
+
+    def _read_hashes(self, paths: list[str]) -> dict[str, str]:
+        """Hash files by reading them on up to `parallel` extra SFTP channels of this
+        connection at once. Each file streams straight into the hash: nothing is written to
+        disk. Whatever a channel can't do (the server refuses extra channels, a read fails, a
+        path isn't a plain file under real directories) is done one by one on the main
+        channel, which keeps its retries, checks and errors."""
+        clients = self._open_readers(min(self.cfg.parallel, len(paths)))
+        out = self._hash_parallel(clients, paths) if clients else {}
+        rest = [p for p in paths if p not in out]
+        if rest:
+            out.update(super().sha256(rest))
+        return out
+
+    def _hash_parallel(self, clients: list[paramiko.SFTPClient],
+                       paths: list[str]) -> dict[str, str]:
+        """Each client takes the next path until none are left; closes the clients."""
+        todo, lock = iter(paths), threading.Lock()
+        out: dict[str, str] = {}
+
+        def work(sftp: paramiko.SFTPClient) -> dict[str, str]:
+            done: dict[str, str] = {}
+            while True:
+                with lock:
+                    path = next(todo, None)
+                if path is None:
+                    return done
+                digest = self._hash_with(sftp, path)
+                if digest:
+                    done[path] = digest
+        try:
+            with ThreadPoolExecutor(len(clients)) as pool:
+                for done in pool.map(work, clients):
+                    out.update(done)
+        finally:
+            for c in clients:
+                c.close()
+        return out
+
+    def _open_readers(self, n: int) -> list[paramiko.SFTPClient]:
+        if n < 2 or self.client is None:
+            return []
+        clients: list[paramiko.SFTPClient] = []
+        for _ in range(n):
+            try:
+                clients.append(self.client.open_sftp())
+            except (paramiko.SSHException, OSError, EOFError):
+                break  # the server allows fewer sessions: use the ones it gave
+        if len(clients) < 2:
+            for c in clients:
+                c.close()
+            return []
+        return clients
+
+    def _hash_with(self, sftp: paramiko.SFTPClient, path: str) -> str | None:
+        """sha256 of `path` read on `sftp`, or None (then it is read on the main channel). The
+        same confinement as every read: real directories from the root down, a regular file."""
+        try:
+            for d in self.confined(path):
+                if not statmod.S_ISDIR(sftp.lstat(d).st_mode or 0):
+                    return None
+            st = sftp.lstat(path)
+            if not statmod.S_ISREG(st.st_mode or 0):
+                return None
+            h = hashlib.sha256()
+            with sftp.open(path, "rb") as f:
+                f.prefetch(st.st_size)
+                while chunk := f.read(1 << 18):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:  # anything at all: the main channel redoes it, with its retries
+            return None
 
     def _sha256sum(self, paths: list[str]) -> dict[str, str]:
         """Hashes from the server's `sha256sum`, without any download fallback (paths it

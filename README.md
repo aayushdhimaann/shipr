@@ -202,6 +202,12 @@ environments:
                                  # its own: not remote_path or a parent of it
     confirm: false               # ask before deploying (use for production)
     ssh_exec: auto               # auto | true | false: run hooks over SSH?
+    server_check: full           # full | changed: what each deploy checks on the server
+                                 # (see "Common workflows")
+    server_commit: null          # with changed: the commit the server holds before shipr's
+                                 # first deploy
+    backup_replaced: true        # back up a server file before replacing it, unless it is
+                                 # exactly what shipr deployed (deletions are always backed up)
     sftp:
       host: example.com
       port: 22
@@ -211,6 +217,8 @@ environments:
       passphrase: "${SHIPR_KEY_PASS}"   # if the key is encrypted
       timeout: 15                       # seconds, for connecting and for each operation
       retries: 3                        # reconnect attempts on network errors (with backoff)
+      parallel: 4                       # files read at once when comparing contents on a
+                                        # server without a shell (1-16; 1 = one at a time)
       known_hosts: null                 # extra known_hosts file to trust
       host_key: null                    # pinned server key, e.g. "SHA256:abc..." (or a list
                                         # while rotating keys); wins over known_hosts
@@ -458,9 +466,34 @@ their own, however old: shipr can't tell a slow deploy from a dead one.
 
 ## Common workflows
 
-**First deploy to a site that already exists** (uploaded earlier with FileZilla): run a normal
-deploy. Files that are already identical are adopted without uploading, and differing files are
-backed up and replaced. Files on the server that aren't in your project are left alone.
+**First deploy to a site that already exists** (uploaded earlier with FileZilla or another
+pipeline): run a normal deploy. Files that are already identical are adopted without uploading,
+and differing files are backed up and replaced. Files on the server that aren't in your project
+are left alone. Only this first deploy compares the server's copies; later deploys upload what
+changed since the last one.
+
+**Trusting the server instead of checking it** (`server_check: changed`). By default every deploy
+lists the server folders that hold your files, which notices edits made on the server, and the
+first deploy also reads each same-size file once to compare it. For a large site where the
+server is known to match git, you can skip all of that:
+
+```yaml
+environments:
+  dev:
+    server_check: changed
+    server_commit: ee9df082f      # what the server holds now, before shipr's first deploy
+```
+
+Each deploy then looks only at files that changed in git since the commit the server holds: the
+last one shipr deployed, or `server_commit` before that. Those are uploaded, replacing the server
+copy without comparing it (it is still copied to the backup folder first; add
+`backup_replaced: false` to skip that), files removed from git are offered for deletion (moved
+into the backup folder), and every other file is trusted to be on the server and never listed
+or read. A file the build changes is always checked, a file
+that failed to upload is retried, and after an interrupted deploy, or without `server_commit`,
+that one deploy checks everything. The catch: edits made directly on the server are not
+noticed, and `shipr status` can't tell whether trusted files changed there. Switching back to
+`server_check: full` compares those files once, without treating them as server edits.
 
 **Everyday deploy:** commit, then run `shipr deploy -e staging`. Check the result, then run
 `shipr deploy -e production`.
@@ -608,6 +641,9 @@ Details are in [docs/security.md](docs/security.md).
 - **Deletions with `state_path` on another filesystem** download and re-upload each file to verify
   the backup, which is slower. A file edited on the server between that check and its removal is
   backed up in its earlier version.
+- **Parallel reading is tested against OpenSSH only.** Other SFTP servers (ProFTPD, Bitvise,
+  hosting panels) may limit or refuse extra channels; shipr then reads one file at a time. Set
+  `sftp.parallel: 1` if a server misbehaves.
 - **Servers that ignore the requested file mode** (some non-OpenSSH servers) leave a temp file at
   their default mode for one request, before any content is written.
 - **shipr relies on paramiko internals** to create temp files 0600 (paramiko's public `open()`

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (2026-11-22)
+## 0.2.0 (unreleased)
 
 ### Security
 
@@ -56,9 +56,9 @@
   few basics. Unset, they still see everything, as before.
 - `sha256sum` output from the server is only trusted when it matches the request exactly.
   Otherwise shipr downloads and hashes the files itself, so a crafted file name can no longer
-  forge another file's hash (C-16).
+  forge another file's hash.
 
-### Network failures (Phase 3A)
+### Network failures
 
 - A rename or delete that the server carried out, but whose reply was lost when the connection
   dropped, is no longer retried blindly and reported as failed. After reconnecting, shipr checks
@@ -73,7 +73,7 @@
   lock and the interrupted-deploy marker, and repeats nothing. The next deploy, after
   `shipr unlock`, finishes the job.
 
-### Hook execution (Phase 3B)
+### Hook execution
 
 - Remote hooks could hang forever and hold the deploy lock. Each hook command now has a timeout,
   `hooks.timeout` (default 1800 seconds; `null` disables it). A timed-out hook fails the deploy,
@@ -88,7 +88,7 @@
 - `sha256sum` batches time out after 300 seconds and fall back to downloading.
 - `Provider.exec` accepts an optional `on_output` callback. Providers without it keep working.
 
-### Hook scheduling and shell detection (Phase 3C)
+### Hook scheduling and shell detection
 
 - A deploy whose only pending change was files kept by `--no-delete` (or a declined deletion
   prompt) re-ran every remote hook and wrote a new history record each time. It is now "up to
@@ -103,7 +103,7 @@
 - `ssh_exec: false` now says it skipped hooks deliberately, instead of "no shell access".
 - New optional `Provider.exec_probe_error()` for providers that probe shell support.
 
-### Configuration and secret hygiene (Phase 3D)
+### Configuration and secret hygiene
 
 - A key given twice in one mapping of `shipr.yml` or the global config is now an error naming
   both lines. YAML used to keep the last value silently, so a second `production:` could
@@ -124,7 +124,7 @@
   files) and on each deploy (listing the files in that deploy, such as `.env`, that the built-in
   excludes would have kept back). File names only; what gets uploaded is unchanged.
 
-### Lock and rollback (Phase 3E)
+### Lock and rollback
 
 - A deploy only ever removes its own lock. Each lock holds a random token and is compared byte for
   byte, instead of searching for the deploy id in the lock's text. The SFTP provider re-reads the
@@ -144,31 +144,58 @@
   a tag, or a rollback used to be recorded as the "branch".
 - New optional `Provider.delete_if_content(path, expected)`; the default works for any provider.
 
-### Filesystems, Python versions and temp files (Phase 3F)
+### Filesystems, Python versions and temp files
 
 - With `state_path` on another filesystem than `remote_path`, every deletion used to fail
   ("Failure" from OpenSSH, EXDEV locally) and the deploy ended partial. The file is now copied
   into the backup folder, the copy is verified by SHA-256 against the original, and only then is
   the original removed. An existing backup is never overwritten, a copy that doesn't match keeps
-  the original, and an interruption at any step leaves the original in place (P-1).
+  the original, and an interruption at any step leaves the original in place.
 - Python 3.10.0–3.10.11 and 3.11.0–3.11.3 crashed on every deploy with a `TypeError` traceback
   (their `tarfile` has no extraction filter). They are now excluded by `requires-python`, and
   shipr itself stops with a clear error on them before doing anything. The git export is still
-  only extracted with the `data` filter: there is no unfiltered fallback (P-2).
+  only extracted with the `data` filter: there is no unfiltered fallback.
 - An upload's temporary file on the server is created 0600 in the open request itself, and gets
   its final mode only once complete. It used to be created with the server's default mode
   (often 0644), so other users on a shared host could read a 0600 file's new content while it
-  uploaded. Final modes are unchanged. The local provider does the same (P-5).
+  uploaded. Final modes are unchanged. The local provider does the same.
 
-### Packaging and release preparation (Phase 3G)
+### Deploying only what changed in git
+
+- New `server_check: changed` (default `full`). Each deploy looks only at files that changed in
+  git since the commit the server holds (the last one shipr deployed, or `server_commit` before
+  shipr's first deploy): it uploads those, replacing the server copies without comparing them,
+  offers files removed from git for deletion, and trusts every other file without listing or
+  reading it. Files changed by the build and files that failed to upload are always checked;
+  after an interrupted deploy, or without `server_commit`, that one deploy checks everything. Edits made on the server to trusted files
+  aren't noticed.
+- New `backup_replaced` (default `true`). Set it to `false` to replace server files without
+  copying them to the backup folder first, in any `server_check` mode. Deleted files are always
+  moved to the backup folder.
+
+### Large servers
+
+- On a server without a shell, comparing files with their server copies (the first full deploy
+  over an existing site) reads up to `sftp.parallel` files at once (default 4) on extra SFTP
+  channels, streaming each into the hash without writing it to disk. If the server refuses extra
+  channels, or a read fails, those files are read one by one as before. Deploys print progress
+  while listing server folders and while comparing files.
+
+- A deploy, `shipr status` and `shipr test` used to list every folder under `remote_path`,
+  including server-only ones like `vendor/`, `writable/`, `uploads/` or `.git`. On a real PHP
+  server that took minutes with no output. They now list only the folders that lead to files
+  shipr deploys or tracks (`shipr test` lists the top level). Symlinks and unreadable folders on
+  the way to those files are still detected. Providers' `walk()` gets an optional `descend`
+  argument; providers without it keep working and list everything.
+
+### Packaging and release preparation
 
 - The version has one source, `src/shipr/__init__.py`, read by the build and by
   `shipr --version`.
 - Package metadata: Python version classifiers, project URLs, PEP 639 license metadata, and an
   sdist limited to sources, tests, docs and examples.
 - A deletion falls back to copying only for a cross-filesystem failure (EXDEV, or OpenSSH's bare
-  "Failure"). Other errors, such as EIO or ENOSPC, used to trigger the copy too; they now fail
-  the file as they did before Phase 3F.
+  "Failure"). Other errors, such as EIO or ENOSPC, fail the file without copying.
 - CI: jobs on the oldest supported patch releases (3.10.12, 3.11.4) replace the old
   `old-patch-release` probe; the process-tree timeout test now also runs on Windows; a new
   `package` job builds the wheel and sdist, installs each in a clean environment and runs the

@@ -33,27 +33,13 @@ def run_shell(command: str, *, cwd: object = None, env: dict[str, str] | None = 
         stderr=subprocess.STDOUT if piped else None,
         text=True, encoding="utf-8", errors="replace", **group)
     kept: list[str] = []
-
-    def pump() -> None:
-        assert proc.stdout is not None
-        if on_output is None:  # capture only: keep the output exactly as printed
-            kept.append(proc.stdout.read())
-            return
-        for line in proc.stdout:
-            on_output(line.rstrip("\r\n"))
-            if capture:
-                kept.append(line)
-
-    reader = threading.Thread(target=pump, daemon=True) if piped else None
-    if reader:
+    reader = None
+    if piped:
+        reader = threading.Thread(target=_pump, args=(proc, on_output, capture, kept),
+                                  daemon=True)
         reader.start()
-    deadline = None if timeout is None else time.monotonic() + timeout
     try:
-        proc.wait(timeout=timeout)
-        if reader:  # a background process may still hold the output open
-            reader.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
-            if reader.is_alive():
-                raise subprocess.TimeoutExpired(command, timeout or 0)
+        _wait(proc, reader, timeout, command)
     except subprocess.TimeoutExpired:
         _stop(proc)
         raise CommandTimeout(f"timed out after {timeout:g}s: {command}; shipr stopped it and "
@@ -62,6 +48,29 @@ def run_shell(command: str, *, cwd: object = None, env: dict[str, str] | None = 
         _stop(proc)
         raise
     return proc.returncode, "".join(kept)
+
+
+def _pump(proc: subprocess.Popen, on_output: Callable[[str], None] | None, capture: bool,
+          kept: list[str]) -> None:
+    assert proc.stdout is not None
+    if on_output is None:  # capture only: keep the output exactly as printed
+        kept.append(proc.stdout.read())
+        return
+    for line in proc.stdout:
+        on_output(line.rstrip("\r\n"))
+        if capture:
+            kept.append(line)
+
+
+def _wait(proc: subprocess.Popen, reader: threading.Thread | None, timeout: float | None,
+          command: str) -> None:
+    """Wait for the command, and for its output to be read, within one `timeout`."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+    proc.wait(timeout=timeout)
+    if reader:  # a background process may still hold the output open
+        reader.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+        if reader.is_alive():
+            raise subprocess.TimeoutExpired(command, timeout or 0)
 
 
 def _stop(proc: subprocess.Popen) -> None:

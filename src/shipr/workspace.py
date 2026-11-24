@@ -40,6 +40,24 @@ class Workspace:
                 for o, n in gitops.renames(old_sha, self.sha, self.repo).items()
                 if o.startswith(strip) and n.startswith(strip)}
 
+    def unchanged_since(self, commit: str) -> set[str] | None:
+        """Deploy-relative files whose content is identical in `commit`, in this commit and in
+        the built output (git blob ids), so a server that holds `commit` already has them. A
+        file the build changed is never included. None if `commit` isn't in the local repo."""
+        try:
+            old_sha = gitops.resolve(commit, self.repo)
+        except GitError:
+            return None
+        old, new = gitops.blobs(old_sha, self.repo), gitops.blobs(self.sha, self.repo)
+        strip = "" if self.prefix == "." else self.prefix + "/"
+        out = set()
+        for path, blob in new.items():
+            rel = path[len(strip):]
+            if path.startswith(strip) and old.get(path) == blob and rel in self.files \
+                    and gitops.blob_id(self.files[rel].path) == blob:
+                out.add(rel)
+        return out
+
     def contains(self, old_sha: str) -> bool:
         """False when old_sha is unknown here or not an ancestor (rollback, force-push)."""
         return gitops.has_commit(old_sha, self.repo) and \
@@ -123,7 +141,7 @@ def command_env(cfg: Config, env: Environment, sha: str) -> dict[str, str]:
 
 
 def credential_warning(cfg: Config, env: Environment) -> str | None:
-    """C-14: local commands without a `build.env` allowlist see every variable, including
+    """Local commands without a `build.env` allowlist see every variable, including
     the ones that supply the provider's credentials. Names them, never their values."""
     if env.build.env is not None or not (
             env.build.commands or env.hooks.local_before or env.hooks.local_after):
@@ -140,7 +158,7 @@ def credential_warning(cfg: Config, env: Environment) -> str | None:
 
 
 def default_excludes_warning(paths: list[str] | None, where: str) -> str:
-    """C-18: what `default_excludes: false` lets through (file names only, never contents).
+    """What `default_excludes: false` lets through (file names only, never contents).
     `paths` None: the files aren't known."""
     off = ("default_excludes is false, so the built-in excludes (.env files, private keys, "
            ".git/, shipr.yml, logs ...) are off")

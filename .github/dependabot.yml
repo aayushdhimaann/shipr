@@ -1,0 +1,8 @@
+# Weekly PRs that bump the pinned action SHAs (and their tag comments). Python dependency bounds
+# in pyproject.toml are deliberate (see docs/RELEASING.md) and changed by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

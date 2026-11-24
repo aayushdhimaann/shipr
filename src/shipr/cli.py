@@ -11,8 +11,9 @@ from pathlib import Path
 import click
 
 from . import __version__, admin, config, engine, gitops, scaffold, workspace
+from .config import Config, Environment
 from .errors import GitError, ShiprError
-from .models import DeployRecord
+from .models import DeployRecord, Manifest
 from .state import LockInfo
 from .ui import UI
 
@@ -35,7 +36,8 @@ class ShiprGroup(click.Group):
         except ShiprError as e:
             raise _Failure(str(e), e.exit_code) from e
         except KeyboardInterrupt:
-            raise _Failure("interrupted: progress was saved; run the command again to finish",
+            raise _Failure("interrupted. If files were being deployed, the progress so far was "
+                           "saved: run the same command again to finish",
                            EXIT_INTERRUPTED) from None
 
 
@@ -196,16 +198,7 @@ def status(obj: Ctx, env_name) -> None:
     if not m.deployed_commit:
         click.echo(f"{env.name}: nothing deployed by shipr yet ({s.target})")
     else:
-        click.echo(f"{env.name}: {m.deployed_commit[:7]}"
-                   f"{f' ({m.branch})' if m.branch else ''} deployed "
-                   f"{m.deployed_at}, {len(m.files)} files tracked")
-        target = env.branch or "HEAD"
-        try:
-            sha = gitops.resolve(target, gitops.repo_root(cfg.dir))
-            state = "up to date" if sha == m.deployed_commit else "not deployed"
-            click.echo(f"{target} is at {sha[:7]} ({state})")
-        except GitError:
-            pass  # not in a repo / ref missing locally: the server-side status is still useful
+        _echo_deployed(cfg, env, m)
     default = "" if env.state_path else " (default location beside remote_path; set " \
         "state_path if your web server could serve it)"
     click.echo(f"records: {s.state_root}{default}")
@@ -220,6 +213,19 @@ def status(obj: Ctx, env_name) -> None:
         click.echo(f"  drift  {rel}  ({why})")
     if not s.drift:
         click.echo("no drift: server files match the last deploy")
+
+
+def _echo_deployed(cfg: Config, env: Environment, m: Manifest) -> None:
+    branch = f" ({m.branch})" if m.branch else ""
+    click.echo(f"{env.name}: {m.deployed_commit[:7]}{branch} deployed "
+               f"{m.deployed_at}, {len(m.files)} files tracked")
+    target = env.branch or "HEAD"
+    try:
+        sha = gitops.resolve(target, gitops.repo_root(cfg.dir))
+    except GitError:
+        return  # not in a repo / ref missing locally: the server-side status is still useful
+    state = "up to date" if sha == m.deployed_commit else "not deployed"
+    click.echo(f"{target} is at {sha[:7]} ({state})")
 
 
 @cli.command()

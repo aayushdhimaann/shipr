@@ -84,6 +84,16 @@ class Environment(BaseModel):
     state_path: str | None = None
     confirm: bool = False
     ssh_exec: bool | Literal["auto"] = "auto"
+    # "full": every deploy reads the server's file list for all deployable files, which also
+    # notices edits made on the server. "changed": the server is trusted to hold the last
+    # deployed commit (before shipr's first deploy: `server_commit`), and a deploy only looks at
+    # files that changed in git since then
+    server_check: Literal["full", "changed"] = "full"
+    server_commit: str | None = None
+    # copy a server file into the backup folder before replacing it, when shipr can't vouch
+    # for its content (edited on the server, never deployed by shipr, or not checked).
+    # Deleted files are always moved into the backup folder.
+    backup_replaced: bool = True
     source: str = "."
     build: Build = Field(default_factory=Build)
     files: Files = Field(default_factory=Files)
@@ -109,6 +119,12 @@ class Environment(BaseModel):
                 "its parents: shipr's records (manifest.json, lock, history/, backups/) would "
                 "mix with your site's files. Use a dedicated directory, ideally outside the "
                 "web root (e.g. /home/<user>/.shipr/<project>)")
+        return self
+
+    @model_validator(mode="after")
+    def _server_commit_needs_changed(self) -> Environment:
+        if self.server_commit and self.server_check != "changed":
+            raise ValueError("server_commit is only used with server_check: changed")
         return self
 
     @property

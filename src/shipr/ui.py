@@ -24,6 +24,10 @@ class UI:
         self.echo(f"warning: {msg}")
 
 
+def plural(n: int, word: str) -> str:
+    return word if n == 1 else word + "s"
+
+
 def show_plan(ui: UI, plan: Plan, renames: dict[str, str]) -> None:
     for op in plan.uploads[:PLAN_LIST_LIMIT]:
         ui.echo(f"  upload  {op.path}  ({op.reason}{', backup first' if op.backup else ''})")

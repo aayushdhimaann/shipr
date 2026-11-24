@@ -6,23 +6,23 @@ success/failure bookkeeping.
 
 from __future__ import annotations
 
-import dataclasses
 import posixpath
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from typing import Any
 
 from . import gitops, providers
 from .config import Config, Environment
 from .errors import Aborted, DeployError, LockedError, ProviderError, StateError, UnsafePath
 from .executor import PlanExecutor
-from .hooks import remote_exec_available, run_local, run_remote_phase
-from .models import DeployRecord, InProgress, Kind, Manifest
-from .planner import Op, Plan, make_plan, safe_join
+from .hooks import _accepts, remote_exec_available, run_local, run_remote_phase
+from .models import DeployRecord, FileEntry, InProgress, Kind, Manifest
+from .planner import UNVERIFIED, Op, Plan, make_plan, safe_join
 from .providers import Provider, RemoteStat
 from .providers.base import leftover_of
 from .state import RemoteState, new_deploy_id, now_iso, whoami
-from .ui import UI, show_plan, show_result
+from .ui import UI, plural, show_plan, show_result
 from .workspace import Workspace, prepare
 
 
@@ -33,6 +33,12 @@ class DeployOptions:
     no_delete: bool = False
     trust_new_host: bool = False
     kind: Kind = "deploy"
+
+    def as_rollback(self) -> DeployOptions:
+        return DeployOptions(**{**vars(self), "kind": "rollback"})
+
+
+HASH_PROGRESS_EVERY = 50  # files per progress line while comparing with server copies
 
 
 def open_provider(env: Environment, trust_new_host: bool = False,
@@ -89,9 +95,45 @@ def state_warnings(env: Environment, state: RemoteState) -> list[str]:
     return []
 
 
-def scan_remote(env: Environment, provider: Provider, state: RemoteState) -> dict[str, RemoteStat]:
-    """Files currently under remote_path, excluding shipr's own state dir."""
-    return provider.walk(env.remote_path, skip=state.root if state.inside_webroot else None)
+def parent_dirs(paths: Iterable[str]) -> set[str]:
+    """Every folder above these relative paths: "a/b/c.txt" -> {"a", "a/b"}."""
+    dirs: set[str] = set()
+    for path in paths:
+        parts = path.split("/")[:-1]
+        dirs.update("/".join(parts[:i]) for i in range(1, len(parts) + 1))
+    return dirs
+
+
+def scan_remote(env: Environment, provider: Provider, state: RemoteState,
+                managed: Iterable[str] | None = None,
+                ui: UI | None = None) -> dict[str, RemoteStat]:
+    """Files currently under remote_path, excluding shipr's own state dir. With `managed`
+    (deploy-relative paths shipr deploys or tracks), only folders on the way to them are listed:
+    a server's vendor/, uploads/, sessions or .git can hold far more entries than the site,
+    and nothing in them is shipr's. A symlink or unreadable folder on the way to a managed path
+    is still seen, in its parent's listing, and leftovers of an upload sit next to its file."""
+    kwargs: dict[str, Any] = {}
+    if managed is not None and _accepts(provider.walk, "descend"):
+        needed = parent_dirs(managed)
+        total, listed = len(needed) + 1, 1  # + remote_path itself
+
+        def descend(rel: str) -> bool:
+            nonlocal listed
+            if rel not in needed:
+                return False
+            listed += 1
+            if ui and listed % 25 == 0:  # one request round trip per folder: can take a while
+                ui.echo(f"  listed {listed}/{total} folders")
+            return True
+        kwargs["descend"] = descend
+        if ui:
+            ui.echo(f"reading the server's file list ({total} folders)...")
+    t0 = time.monotonic()
+    remote = provider.walk(env.remote_path, skip=state.root if state.inside_webroot else None,
+                           **kwargs)
+    if ui and kwargs:
+        ui.echo(f"read {total} folders in {time.monotonic() - t0:.0f}s")
+    return remote
 
 
 def deploy(cfg: Config, env: Environment, ref: str | None = None,
@@ -136,7 +178,7 @@ class Deployment:
         try:
             manifest, remote, plan = self._load_and_plan()
             # deletions only count once approved: kept files are no reason to run hooks
-            other_work = bool(plan.uploads or plan.adopt or plan.forget
+            other_work = bool(plan.uploads or plan.adopt or plan.assumed or plan.forget
                               or manifest.deployed_commit != self.ws.sha
                               or manifest.in_progress or manifest.hooks_pending)
             if not other_work and (not plan.deletes or self.options.no_delete):
@@ -188,9 +230,11 @@ class Deployment:
         self.record.status = "up-to-date"
         self.record.kept = [o.path for o in plan.deletes]
         kept = len(self.record.kept)
-        self.ui.echo("already up to date" + (
-            f"; {kept} removed file{'s' if kept != 1 else ''} kept on the server "
-            "(deploy without --no-delete and confirm to remove them)" if kept else ""))
+        note = ""
+        if kept:
+            note = (f"; {kept} removed {plural(kept, 'file')} kept on the server "
+                    "(deploy without --no-delete and confirm to remove them)")
+        self.ui.echo("already up to date" + note)
         return self.record
 
     def _lock(self) -> None:
@@ -217,17 +261,76 @@ class Deployment:
         if first and not manifest.deployed_commit and not manifest.files:
             self.ui.warn(first)  # once: when the records are first created there
         self._warn_about(manifest)
-        remote = scan_remote(self.env, self.provider, self.state)
+        trusted = self._trusted_unchanged(manifest)
+        skip = trusted or set()
+        local = {rel: f for rel, f in self.ws.files.items() if rel not in skip}
+        tracked = {rel: e for rel, e in manifest.files.items() if rel not in skip}
+        remote = scan_remote(self.env, self.provider, self.state,
+                             managed=set(local) | set(tracked), ui=self.ui)
         self._leftovers = self._own_leftovers(manifest, remote)
-        plan = make_plan(self.ws.files, manifest.files, remote, self.ws.rules,
+        plan = make_plan(local, tracked, remote, self.ws.rules,
                          self._remote_hashes, reserved=self.state.rel,
-                         recovering=manifest.in_progress is not None)
+                         recovering=manifest.in_progress is not None,
+                         replace=trusted is not None)
+        if not self.env.backup_replaced:
+            for op in plan.uploads:
+                op.backup = False
+        plan.unchanged += len(skip)
+        plan.assumed = {rel: FileEntry(sha256=self.ws.files[rel].sha256,
+                                       size=self.ws.files[rel].size, mtime=UNVERIFIED)
+                        for rel in skip if rel not in manifest.files}
         show_plan(self.ui, plan, self.ws.renames_since(manifest.deployed_commit))
         if plan.blocked:
             self.record.blocked = [rel for rel, _ in plan.blocked]
             self.ui.warn(f"{len(plan.blocked)} paths left untouched: the server has a symlink, "
                          "special file or unreadable directory there (see `skip` above)")
         return manifest, remote, plan
+
+    def _trusted_unchanged(self, manifest: Manifest) -> set[str] | None:
+        """server_check: changed. The files the server is trusted to hold already: identical
+        in git (and after the build) since the commit it holds, and, once shipr has records,
+        recorded as deployed with that content (so a file that failed to upload is retried).
+        None: look at every file, as with server_check: full."""
+        env = self.env
+        if env.server_check != "changed":
+            return None
+        if manifest.in_progress:
+            self.ui.warn("server_check: changed: the last deploy was interrupted, so this one "
+                         "checks every file on the server")
+            return None
+        base = manifest.deployed_commit or (None if manifest.files else env.server_commit)
+        if not base:
+            self.ui.echo("server_check: changed: no deployed commit known yet, so this first "
+                         "deploy checks every file (set server_commit to skip that)")
+            return None
+        same = self.ws.unchanged_since(base)
+        if same is None:
+            if base == env.server_commit and not manifest.deployed_commit:
+                raise DeployError(f"server_commit {base!r} is not a commit in your local repo; "
+                                  "run git fetch, or check the value")
+            self.ui.warn(f"server_check: changed: the deployed commit {base[:7]} is not in your "
+                         "local repo (git fetch?), so this deploy checks every file")
+            return None
+        if manifest.files:
+            same = {rel for rel in same if (e := manifest.files.get(rel))
+                    and e.sha256 == self.ws.files[rel].sha256}
+        self._show_commits_since(base)
+        self.ui.echo(f"server_check: changed: {len(same)} files unchanged since {base[:9]} are "
+                     "trusted to be on the server and not checked")
+        return same
+
+    def _show_commits_since(self, base: str, limit: int = 20) -> None:
+        """All commits since `base` are deployed, whatever their number: they are compared as
+        one change. Lists the first `limit`."""
+        commits = gitops.git("log", "--format=%h %s", f"{base}..{self.ws.sha}",
+                             cwd=self.ws.repo, check=False).splitlines()
+        if not commits:
+            return
+        lines = [f"  {c}" for c in commits[:limit]]
+        if len(commits) > limit:
+            lines.append(f"  ... and {len(commits) - limit} more")
+        self.ui.echo(f"{len(commits)} {plural(len(commits), 'commit')} since {base[:9]}:\n"
+                     + "\n".join(lines))
 
     def _own_leftovers(self, manifest: Manifest, remote: dict[str, RemoteStat]) -> list[str]:
         """Temp and park files from interrupted uploads of files shipr manages. They are taken
@@ -288,7 +391,17 @@ class Deployment:
 
     def _remote_hashes(self, rels: list[str]) -> dict[str, str]:
         abs_of = {r: safe_join(self.env.remote_path, r) for r in rels}
-        by_abs = self.provider.sha256(list(abs_of.values()))
+        paths = list(abs_of.values())
+        by_abs: dict[str, str] = {}
+        if len(paths) > HASH_PROGRESS_EVERY:
+            how = ("the server hashes them" if self.provider.can_exec()
+                   else "each is downloaded once: the server has no shell")
+            self.ui.echo(f"comparing {len(paths)} files with their server copies ({how})...")
+        for i in range(0, len(paths), HASH_PROGRESS_EVERY):
+            by_abs.update(self.provider.sha256(paths[i:i + HASH_PROGRESS_EVERY]))
+            done = min(i + HASH_PROGRESS_EVERY, len(paths))
+            if len(paths) > HASH_PROGRESS_EVERY and done < len(paths):
+                self.ui.echo(f"  compared {done}/{len(paths)} files")
         return {r: by_abs.get(a, "") for r, a in abs_of.items()}
 
     def _confirm(self, plan: Plan) -> list[Op]:
@@ -324,20 +437,7 @@ class Deployment:
             if has_remote_hooks:
                 record.hooks = "not-run" if can_exec else "skipped"
             self._hooks(env.hooks.remote_before, "remote_before", can_exec)
-
-            manifest.in_progress = InProgress(deploy_id=record.id, by=record.by,
-                                              started=record.started)
-            try:
-                self.state.ensure_private()
-                self.state.save_manifest(manifest)  # before any file changes
-            except (OSError, ProviderError) as e:
-                raise StateError(f"cannot write deploy records to {self.state.root} ({e}); "
-                                 "nothing on the server was changed") from None
-            PlanExecutor(self.provider, self.state, manifest, record, self.ws.files, remote,
-                         env.remote_path, self.ui).run(plan, deletes)
-            record.files_done = True
-            self._remove_leftovers()
-            record.status = "partial" if record.failed else "success"
+            self._write_files(manifest, remote, plan, deletes)
             if record.failed and env.hooks.remote_after:
                 self.ui.warn("some files failed; remote_after hooks skipped (they run on the "
                              "next deploy)")
@@ -356,6 +456,24 @@ class Deployment:
             self._save_error = self._save(manifest)
             if self._save_error and failed:  # don't hide the original error
                 self.ui.warn(self._save_error)
+
+    def _write_files(self, manifest: Manifest, remote: dict[str, RemoteStat], plan: Plan,
+                     deletes: list[Op]) -> None:
+        """Mark the deploy as in progress in the manifest, then change the files."""
+        record = self.record
+        manifest.in_progress = InProgress(deploy_id=record.id, by=record.by,
+                                          started=record.started)
+        try:
+            self.state.ensure_private()
+            self.state.save_manifest(manifest)  # before any file changes
+        except (OSError, ProviderError) as e:
+            raise StateError(f"cannot write deploy records to {self.state.root} ({e}); "
+                             "nothing on the server was changed") from None
+        PlanExecutor(self.provider, self.state, manifest, record, self.ws.files, remote,
+                     self.env.remote_path, self.ui).run(plan, deletes)
+        record.files_done = True
+        self._remove_leftovers()
+        record.status = "partial" if record.failed else "success"
 
     def _hooks(self, commands: list[str], phase: str, can_exec: bool) -> None:
         try:
@@ -434,8 +552,7 @@ def rollback(cfg: Config, env: Environment, to: str | None = None,
     if not gitops.has_commit(target.commit, gitops.repo_root(cfg.dir)):
         raise DeployError(f"commit {target.commit[:7]} is not in your local repo; "
                           "run git fetch first")
-    options = dataclasses.replace(options or DeployOptions(), kind="rollback")
-    return deploy(cfg, env, target.commit, options, ui)
+    return deploy(cfg, env, target.commit, (options or DeployOptions()).as_rollback(), ui)
 
 
 def _pick(records: list[DeployRecord], to: str) -> DeployRecord:

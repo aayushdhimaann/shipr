@@ -215,3 +215,14 @@ def test_failed_restore_keeps_park_and_names_it(src):
     with pytest.raises(ProviderError, match=kept_at):
         make_provider(s).upload(src, "/w/a.txt")
     assert [s.data(k) for k in s.nodes if k.endswith(".shipr-old")] == [b"old"]
+
+
+def test_walk_lists_only_the_folders_it_is_asked_to(srv):
+    for rel in ("index.php", "app/x.php", "vendor/a/b.php", ".git/objects/ab/cd"):
+        srv.file(f"/w/{rel}", "x")
+    srv.link("/w/app/shared", "/elsewhere")  # an opaque entry on the way is still reported
+    p = make_provider(srv)
+    out = p.walk("/w", descend={"app"}.__contains__)
+    assert set(out) == {"index.php", "app/x.php", "app/shared"} and out["app/shared"].kind == \
+        "symlink"
+    assert {path for op, path in srv.calls if op == "listdir"} == {"/w", "/w/app"}

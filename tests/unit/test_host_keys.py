@@ -1,5 +1,8 @@
 """C-10: host-key pinning and confirmed trust-on-first-use (no network)."""
 
+import os
+import stat
+
 import paramiko
 import pytest
 
@@ -91,3 +94,12 @@ def test_appending_never_glues_onto_a_hand_edited_last_line(tmp_path):
     policy(tmp_path, trust=True, confirm=lambda h, f: True).missing_host_key(Client(), "h", KEY)
     keys = paramiko.HostKeys(str(store))
     assert keys.lookup("other") and keys.lookup("h")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
+def test_saving_a_key_makes_a_loose_known_hosts_private(tmp_path):
+    store = tmp_path / "known_hosts"
+    store.write_text("")
+    store.chmod(0o664)
+    policy(tmp_path, trust=True, confirm=lambda h, f: True).missing_host_key(Client(), "h", KEY)
+    assert stat.S_IMODE(store.stat().st_mode) == 0o600

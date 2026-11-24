@@ -82,7 +82,10 @@ class Provider(ABC):
     def walk(self, root: str, skip: str | None = None) -> dict[str, RemoteStat]:
         """Files under `root` (recursive) keyed by POSIX path relative to root.
 
-        `skip` is an absolute directory to leave out (shipr's state dir)."""
+        `skip` is an absolute directory to leave out (shipr's state dir). Optional keyword
+        `descend(rel_dir) -> bool`: list a subdirectory only if it returns True (shipr passes it
+        so that folders like vendor/ or uploads/ aren't crawled); providers without it are
+        called without it and list everything."""
 
     @abstractmethod
     def upload(self, local: Path, remote: str, mode: int | None = None) -> RemoteStat:
@@ -275,19 +278,23 @@ def is_within(path: str, root: str) -> bool:
     return p[:len(r)] == r
 
 
+TMP_SUFFIX = ".shipr-tmp"  # .<name>.shipr-tmp: an upload in progress
+PARK_SUFFIX = ".shipr-old"  # .<name>.<8 hex>.shipr-old: the old file during a non-atomic swap
+
+
 def tmp_name(remote: str) -> str:
     d, base = posixpath.split(remote)
-    return posixpath.join(d, f".{base}.shipr-tmp")
+    return posixpath.join(d, f".{base}{TMP_SUFFIX}")
 
 
 def park_name(remote: str) -> str:
     """Where a non-atomic swap parks the old file: unique, so a leftover from an earlier crash
     can never block (or be overwritten by) a later swap."""
     d, base = posixpath.split(remote)
-    return posixpath.join(d, f".{base}.{secrets.token_hex(4)}.shipr-old")
+    return posixpath.join(d, f".{base}.{secrets.token_hex(4)}{PARK_SUFFIX}")
 
 
-_PARK = re.compile(r"\.(.+)\.[0-9a-f]{8}\.shipr-old")
+_PARK = re.compile(r"\.(.+)\.[0-9a-f]{8}" + re.escape(PARK_SUFFIX))
 
 
 def leftover_of(path: str) -> tuple[str, str] | None:
@@ -296,8 +303,8 @@ def leftover_of(path: str) -> tuple[str, str] | None:
     m = _PARK.fullmatch(name)
     if m:
         return "park", posixpath.join(d, m.group(1))
-    if name.startswith(".") and name.endswith(".shipr-tmp") and len(name) > len("..shipr-tmp"):
-        return "tmp", posixpath.join(d, name[1:-len(".shipr-tmp")])
-    if name.endswith(".shipr-old") and len(name) > len(".shipr-old"):
-        return "park", posixpath.join(d, name[:-len(".shipr-old")])  # pre-0.2 name
+    if name.startswith(".") and name.endswith(TMP_SUFFIX) and len(name) > len(TMP_SUFFIX) + 1:
+        return "tmp", posixpath.join(d, name[1:-len(TMP_SUFFIX)])
+    if name.endswith(PARK_SUFFIX) and len(name) > len(PARK_SUFFIX):
+        return "park", posixpath.join(d, name[:-len(PARK_SUFFIX)])  # pre-0.2 name
     return None

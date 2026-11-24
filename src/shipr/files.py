@@ -60,6 +60,11 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _links_to_file_inside(link: Path, root: Path) -> bool:
+    target = link.resolve()
+    return target.is_file() and target.is_relative_to(root)
+
+
 def collect(root: Path, rules: Rules,
             warn: Callable[[str], None] = print) -> dict[str, LocalFile]:
     """Map POSIX relative path -> LocalFile for every deployable file under `root`."""
@@ -74,11 +79,9 @@ def collect(root: Path, rules: Rules,
             if not rules.wanted(rel):
                 continue
             p = Path(dirpath, name)
-            if p.is_symlink():
-                target = p.resolve()
-                if not target.is_file() or not target.is_relative_to(root):
-                    warn(f"skipping symlink {rel} (points outside the project)")
-                    continue
+            if p.is_symlink() and not _links_to_file_inside(p, root):
+                warn(f"skipping symlink {rel} (points outside the project)")
+                continue
             st = p.stat()
             # keep the executable bit, drop group/other write (build output may be 0664)
             out[rel] = LocalFile(p, sha256_file(p), st.st_size, st.st_mode & 0o755)

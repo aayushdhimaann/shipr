@@ -39,6 +39,28 @@ def _default_mode(probe: Path) -> int:
         probe.unlink()
 
 
+def _sort_entry(p: Path, base: Path, skip: Path | None,
+                descend: Callable[[str], bool] | None, out: dict[str, RemoteStat]) -> bool:
+    """Put one listed entry into `out` (a file, symlink, special file or unreadable entry);
+    True if it is a folder to descend into."""
+    rel = p.relative_to(base).as_posix()
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return False  # deleted since the directory was listed
+    except OSError:  # listable but not inspectable (e.g. a dir with r but no x)
+        out[rel] = RemoteStat(0, 0, kind="unreadable")
+        return False
+    kind = _kind(st)
+    if kind == "dir":
+        return p != skip and (descend is None or descend(rel))
+    if kind == "file":
+        out[rel] = RemoteStat(st.st_size, int(st.st_mtime), st.st_mode & 0o7777)
+    else:
+        out[rel] = RemoteStat(st.st_size, int(st.st_mtime), kind=kind)
+    return False
+
+
 class LocalProvider(Provider):
     name = "local"
 
@@ -87,7 +109,8 @@ class LocalProvider(Provider):
             return None
         return self._stat(self._p(path))
 
-    def walk(self, root: str, skip: str | None = None) -> dict[str, RemoteStat]:
+    def walk(self, root: str, skip: str | None = None,
+             descend: Callable[[str], bool] | None = None) -> dict[str, RemoteStat]:
         if not self._check_dirs(root):
             return {}
         if self.roots and root not in self.roots and self._lkind(root) not in (None, "dir"):
@@ -105,26 +128,9 @@ class LocalProvider(Provider):
             out[p.relative_to(base).as_posix()] = RemoteStat(0, 0, kind="unreadable")
 
         for dirpath, dirnames, filenames in os.walk(base, onerror=unreadable):
-            descend = []
-            for name in dirnames + filenames:
-                p = Path(dirpath, name)
-                rel = p.relative_to(base).as_posix()
-                try:
-                    st = os.lstat(p)
-                except FileNotFoundError:
-                    continue  # deleted since the directory was listed
-                except OSError:  # listable but not inspectable (e.g. a dir with r but no x)
-                    out[rel] = RemoteStat(0, 0, kind="unreadable")
-                    continue
-                kind = _kind(st)
-                if kind == "dir":
-                    if p != skip_p:
-                        descend.append(name)
-                elif kind == "file":
-                    out[rel] = RemoteStat(st.st_size, int(st.st_mtime), st.st_mode & 0o7777)
-                else:
-                    out[rel] = RemoteStat(st.st_size, int(st.st_mtime), kind=kind)
-            dirnames[:] = descend  # os.walk lists symlinked dirs here: never descend into them
+            # os.walk lists symlinked dirs in dirnames: never descend into them
+            dirnames[:] = [name for name in dirnames + filenames
+                           if _sort_entry(Path(dirpath, name), base, skip_p, descend, out)]
         return out
 
     def upload(self, local: Path, remote: str, mode: int | None = None) -> RemoteStat:
@@ -137,7 +143,7 @@ class LocalProvider(Provider):
         if tmp_kind is not None:  # a link itself (never its target), or an earlier partial
             self._p(tmp).unlink()
         final = mode if mode is not None else _default_mode(self._p(tmp))
-        # created 0600 (O_EXCL: never through a symlink), final mode only once complete (P-5)
+        # created 0600 (O_EXCL: never through a symlink), final mode only once complete
         fd = os.open(self._p(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL
                      | getattr(os, "O_BINARY", 0), 0o600)
         with os.fdopen(fd, "wb") as out, local.open("rb") as src:

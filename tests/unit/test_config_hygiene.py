@@ -143,6 +143,7 @@ def env_with(sftp, **extra):
     ({"host": "h", "username": "u", "port": 70000}, "port"),
     ({"host": "h", "username": "u", "timeout": 0}, "timeout"),
     ({"host": "h", "username": "u", "retries": -1}, "retries"),
+    ({"host": "h", "username": "u", "parallel": 0}, "parallel"),
 ])
 def test_bad_sftp_settings_fail_validation(tmp_path, sftp, problem):
     with pytest.raises(ConfigError, match=f"(?s)invalid sftp settings.*{problem}"):

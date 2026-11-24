@@ -209,3 +209,18 @@ def test_hook_timeout_defaults_to_30_minutes_and_can_be_disabled(tmp_path):
         raw["hooks"] = {"timeout": bad}
         with pytest.raises(ConfigError, match="timeout"):
             make(tmp_path, raw).env("prod")
+
+
+def test_server_check_and_server_commit(tmp_path):
+    env = {"remote_path": "/w", "sftp": SFTP}
+    assert make(tmp_path, {"environments": {"prod": env}}).env("prod").server_check == "full"
+    assert make(tmp_path, {"environments": {"prod": env}}).env("prod").backup_replaced is True
+    ok = make(tmp_path, {"environments": {"prod": {**env, "server_check": "changed",
+                                                   "server_commit": "ee9df082f"}}})
+    assert ok.env("prod").server_commit == "ee9df082f"
+    assert make(tmp_path, {"environments": {"prod": {**env, "server_check": "changed"}}}) \
+        .env("prod").server_commit is None  # first deploy then checks everything once
+    for bad, msg in (({"server_commit": "ee9df082f"}, "server_check: changed"),
+                     ({"server_check": "fast"}, "server_check")):
+        with pytest.raises(ConfigError, match=msg):
+            make(tmp_path, {"environments": {"prod": {**env, **bad}}}).env("prod")

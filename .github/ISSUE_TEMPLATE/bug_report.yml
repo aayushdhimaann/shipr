@@ -1,0 +1,48 @@
+name: Bug report
+description: shipr did something wrong or unexpected.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Remove hostnames, usernames, paths you'd rather keep private, and any secret before posting.**
+        Security problems go through SECURITY.md, not here.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The command you ran and the relevant part of shipr.yml (without secrets).
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: shipr's output, with secrets and hostnames removed.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: shipr version
+      description: "`shipr --version`"
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: OS and Python version
+      placeholder: Ubuntu 24.04, Python 3.12.3
+    validations:
+      required: true
+  - type: input
+    id: server
+    attributes:
+      label: Server
+      description: SFTP server software if known (OpenSSH, ProFTPD, a hosting panel...), and whether SSH commands work there.

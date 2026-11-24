@@ -51,7 +51,9 @@ class PlanExecutor:
             self._guarded(op, self._delete)
 
     def _apply_bookkeeping(self, plan: Plan) -> None:
-        """Record identical untracked files; drop entries for files already gone remotely."""
+        """Record identical untracked files and the ones trusted to be there already; drop
+        entries for files already gone remotely."""
+        self.manifest.files.update(plan.assumed)
         for rel, sha in plan.adopt.items():
             r = self.remote[rel]
             self.manifest.files[rel] = FileEntry(sha256=sha, size=r.size, mtime=r.mtime)
@@ -97,7 +99,7 @@ class PlanExecutor:
         self._remove_empty_parents(target)
 
     def _copy_then_remove(self, target: str, backup: str, why: OSError) -> None:
-        """P-1: the move into the backup folder failed, typically because state_path is on
+        """The move into the backup folder failed, typically because state_path is on
         another filesystem. Copy instead (the backup appears whole, via a temp file), verify it
         by hash against the original, and only then remove the original. Until that last step
         the original is untouched, so an interruption at any point loses nothing."""

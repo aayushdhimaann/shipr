@@ -6,7 +6,7 @@ import paramiko
 import pytest
 
 from shipr import admin, config, engine
-from shipr.errors import ProviderError
+from shipr.errors import ProviderError, UnsafePath
 from shipr.providers.sftp import SFTPProvider
 from tests import helpers
 from tests.helpers import RecordingUI, load_env
@@ -792,3 +792,76 @@ def test_uploads_are_private_from_their_first_byte(project, request, server_fixt
         assert mode(f"{remote}/config.php") == 0o600
         assert mode(f"{remote}/index.php") == 0o644
         assert mode(f"{env.effective_state_path}/manifest.json") == default  # unchanged
+
+
+# --- parallel content comparison when the server has no shell ----------------------------------
+def upload_numbered(p, remote, tmp_path, n=24):
+    import hashlib
+
+    want = {}
+    for i in range(n):
+        f = tmp_path / f"f{i}"
+        f.write_bytes(f"content {i} ".encode() * (i * 500 + 1))  # up to ~150 KB each
+        p.upload(f, f"{remote}/d{i % 3}/f{i}.txt")
+        want[f"{remote}/d{i % 3}/f{i}.txt"] = hashlib.sha256(f.read_bytes()).hexdigest()
+    return want
+
+
+@pytest.mark.parametrize("server_fixture", ["ssh_server", "sftp_only_server"])
+def test_hashing_by_download_uses_several_channels(project, request, server_fixture, tmp_path,
+                                                   monkeypatch):
+    import threading
+
+    from shipr.providers.sftp import SFTPProvider
+
+    remote = configure(project, request.getfixturevalue(server_fixture),
+                       f"      password: {PASSWORD}\n")
+    threads = set()
+    real = SFTPProvider._hash_with
+
+    def hash_with(self, sftp, path):
+        threads.add(threading.get_ident())
+        return real(self, sftp, path)
+    monkeypatch.setattr(SFTPProvider, "_hash_with", hash_with)
+    with provider(project) as p:
+        want = upload_numbered(p, remote, tmp_path)
+        p.exec_allowed = False  # as on a server without a shell: hash by reading each file
+        assert p.sha256(list(want)) == want
+    assert len(threads) > 1  # read on several channels at once
+
+
+def test_hashing_falls_back_when_the_server_refuses_more_channels(project, ssh_server, tmp_path,
+                                                                 monkeypatch):
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n")
+    with provider(project) as p:
+        want = upload_numbered(p, remote, tmp_path, n=6)
+        p.exec_allowed = False
+        monkeypatch.setattr(paramiko.SSHClient, "open_sftp", lambda self: (_ for _ in ()).throw(
+            paramiko.ChannelException(1, "administratively prohibited")))
+        assert p.sha256(list(want)) == want  # one file at a time, on the main channel
+
+
+def test_parallel_hashing_never_reads_through_a_symlink(project, ssh_server, tmp_path):
+    remote = configure(project, ssh_server, f"      password: {PASSWORD}\n")
+    with provider(project) as p:
+        want = upload_numbered(p, remote, tmp_path, n=3)
+        p.exec(f"mkdir -p {remote}/../outside && echo secret > {remote}/../outside/f.txt && "
+               f"ln -s ../outside {remote}/linked")
+        p.exec_allowed = False
+        with pytest.raises(UnsafePath):
+            p.sha256([*want, f"{remote}/linked/f.txt"])
+
+
+def test_first_full_deploy_over_an_existing_site_without_shell(project, sftp_only_server):
+    configure(project, sftp_only_server, f"      password: {PASSWORD}\n")
+    for i in range(30):
+        project.write(f"d{i % 4}/f{i}.php", f"<?php {i};")
+    project.commit()
+    assert deploy(project).status == "success"
+    env = load_env(project.repo)[1]
+    with provider(project) as p:  # forget shipr's records: the site now looks hand-uploaded
+        for name in p.walk(env.effective_state_path):
+            p.delete(f"{env.effective_state_path}/{name}")
+    ui = RecordingUI()
+    rec = deploy(project, ui=ui)
+    assert rec.status == "success" and not rec.uploaded  # all 30 compared and found identical
