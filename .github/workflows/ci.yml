@@ -1,6 +1,11 @@
 name: ci
 on: [push, pull_request]
 
+# Read-only token for every job: CI only reads the code, and a fork's pull request can't use
+# this workflow to push, tag or change the repository.
+permissions:
+  contents: read
+
 # Actions are pinned to commit SHAs (tag in the comment): a moved or compromised tag can't change
 # what runs here. Bump them deliberately.
 
