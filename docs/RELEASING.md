@@ -1,9 +1,8 @@
 # Releasing shipr
 
-Publishing to PyPI is **not set up yet**. It waits until PyPI trusted publishing (OIDC from
-GitHub Actions, no stored token) is configured for the project. Until then a release is a git tag
-plus the wheel and sdist attached to a GitHub release, installed with
-`uv tool install git+https://github.com/aayushdhimaann/shipr@vX.Y.Z` or from the wheel.
+A release is a git tag, a GitHub release with the wheel and sdist attached, and the same files
+on PyPI. `.github/workflows/release.yml` uploads them with PyPI trusted publishing (GitHub Actions
+proves its identity to PyPI; no API token is stored anywhere).
 
 ## Version
 
@@ -51,6 +50,15 @@ The version lives in one place: `src/shipr/__init__.py`. `pyproject.toml` reads 
 7. **Tag and attach.** `git tag -s vX.Y.Z && git push origin vX.Y.Z`, then create a GitHub release
    for the tag with the changelog section and attach both files from `dist/`, with their SHA-256
    (`sha256sum dist/*`).
+8. **Publish to PyPI.** Publishing the GitHub release starts the `release` workflow. It builds
+   from the tag, checks that the tag matches the package version, smoke-tests the installed
+   wheel, and checks that its files are byte-identical to the ones attached to the release (the
+   build is reproducible). The `publish` job then waits in the `pypi` environment: approve it in
+   the workflow run, and it uploads. A PyPI version can never be uploaded again, even after it is
+   deleted, so a mistake means a new version number.
+
+   For a tag that already has a GitHub release, run it by hand: Actions → release → Run workflow,
+   with the tag (e.g. `v0.2.0`).
 
 ## Supported Python versions
 
@@ -67,9 +75,10 @@ paramiko 4.0.0, pathspec 0.12.0, pydantic 2.6.0, python-dotenv 1.0.0 and PyYAML 
 capped below 6 because uploads use its internals (see docs/security.md); before raising the cap,
 run `tests/unit/test_sftp_private_create.py` and the integration suite against the new version.
 
-## Later: PyPI
+## PyPI setup (once)
 
-When trusted publishing is configured on PyPI for this repository, add a tag-triggered workflow
-job that builds with `uv build`, runs `scripts/smoke_installed.py`, and uploads with
-`pypa/gh-action-pypi-publish` pinned to a commit SHA, in a protected `pypi` environment with
-`id-token: write`. No API token is stored anywhere.
+- pypi.org → Account → Publishing → add a (pending) trusted publisher: project `shipr`, owner
+  `aayushdhimaann`, repository `shipr`, workflow `release.yml`, environment `pypi`.
+- GitHub → Settings → Environments → `pypi`, with the maintainer as a required reviewer, so
+  nothing reaches PyPI without an approval.
+- Only the `publish` job has `id-token: write`; the build and its tests run without it.

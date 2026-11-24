@@ -1,0 +1,70 @@
+name: release
+# Publish a release to PyPI with trusted publishing: PyPI trusts this workflow, in the `pypi`
+# environment, instead of a stored token. Runs when a GitHub release is published, or by hand
+# for an existing tag (Actions → release → Run workflow).
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, e.g. v0.2.0"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Build from the tag and test the installed wheel. This job has no publishing rights.
+  build:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d  # v10.4.0
+      - run: uv build
+      - name: the tag matches the package version
+        run: test -f "dist/shipr-${TAG#v}-py3-none-any.whl" || { ls dist; echo "::error::tag $TAG is not the version in src/shipr/__init__.py"; exit 1; }
+      - run: uv run --no-project python scripts/smoke_installed.py --dist dist
+      - name: installed wheel works
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/wheel"
+          uv pip install --python "$RUNNER_TEMP/wheel" dist/*.whl
+          uv run --no-project python scripts/smoke_installed.py --dist dist --venv "$RUNNER_TEMP/wheel"
+      # the builds are reproducible: files attached to the GitHub release (whose checksums the
+      # release notes list) must be byte-identical to what goes to PyPI
+      - name: same files as the GitHub release
+        run: |
+          names=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          if [ -z "$names" ]; then echo "no files attached to the release; nothing to compare"; exit 0; fi
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/attached"
+          for f in dist/*; do
+            cmp "$f" "$RUNNER_TEMP/attached/$(basename "$f")" || { echo "::error::$f differs from the file attached to the release"; exit 1; }
+          done
+          sha256sum dist/*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # Upload only. The `pypi` environment requires your approval before this job starts.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/shipr/
+    permissions:
+      id-token: write  # proves to PyPI that this workflow is uploading; nothing else gets it
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
