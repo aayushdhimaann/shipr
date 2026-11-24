@@ -79,14 +79,15 @@ def _stop(proc: subprocess.Popen) -> None:
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
     else:
         for sig, grace in ((signal.SIGTERM, 3.0), (signal.SIGKILL, 3.0)):
+            # macOS answers EPERM, not ESRCH, for a group left with only zombies: gone too
             try:
                 os.killpg(proc.pid, sig)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 break  # the whole group is already gone
             try:
                 proc.wait(timeout=grace)
                 os.killpg(proc.pid, 0)  # the shell exited: are its children gone too?
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 break
             except subprocess.TimeoutExpired:
                 continue

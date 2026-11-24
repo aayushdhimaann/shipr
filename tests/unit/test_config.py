@@ -221,6 +221,7 @@ def test_server_check_and_server_commit(tmp_path):
     assert make(tmp_path, {"environments": {"prod": {**env, "server_check": "changed"}}}) \
         .env("prod").server_commit is None  # first deploy then checks everything once
     for bad, msg in (({"server_commit": "ee9df082f"}, "server_check: changed"),
-                     ({"server_check": "fast"}, "server_check")):
+                     ({"server_check": "fast"}, "server_check"),
+                     ({"server_check": "changed", "server_commit": 123456789}, "quote it")):
         with pytest.raises(ConfigError, match=msg):
             make(tmp_path, {"environments": {"prod": {**env, **bad}}}).env("prod")

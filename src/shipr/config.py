@@ -121,6 +121,14 @@ class Environment(BaseModel):
                 "web root (e.g. /home/<user>/.shipr/<project>)")
         return self
 
+    @field_validator("server_commit", mode="before")
+    @classmethod
+    def _commit_is_text(cls, v: object) -> object:
+        if v is not None and not isinstance(v, str):  # e.g. 123456789, or 01234567 (octal)
+            raise ValueError('YAML read this commit as a number: quote it, e.g. '
+                             'server_commit: "123456789"')
+        return v
+
     @model_validator(mode="after")
     def _server_commit_needs_changed(self) -> Environment:
         if self.server_commit and self.server_check != "changed":

@@ -1435,7 +1435,7 @@ def count_server_reads(monkeypatch):
 def changed_mode(project, server_commit=None, backups=True):
     add_env_option(project, "server_check: changed")
     if server_commit:
-        add_env_option(project, f"server_commit: {server_commit}")
+        add_env_option(project, f"server_commit: '{server_commit}'")  # an all-digit prefix
     if not backups:
         add_env_option(project, "backup_replaced: false")
 

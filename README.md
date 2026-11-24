@@ -481,7 +481,8 @@ server is known to match git, you can skip all of that:
 environments:
   dev:
     server_check: changed
-    server_commit: ee9df082f      # what the server holds now, before shipr's first deploy
+    server_commit: "ee9df082f"    # what the server holds now, before shipr's first deploy
+                                  # (quoted: an all-digit hash would be read as a number)
 ```
 
 Each deploy then looks only at files that changed in git since the commit the server holds: the
